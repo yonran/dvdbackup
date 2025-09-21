@@ -1,0 +1,112 @@
+--- a/src/dvdbackup.c
++++ b/src/dvdbackup.c
+@@ -1412,7 +1412,7 @@
+ 	int size;
+ 
+ 	/* DVD handler */
+-	ifo_handle_t* ifo_file = NULL;
++	dvd_file_t* ifo_file = NULL;
+ 
+ 
+ 	if (title_set_info->number_of_title_sets + 1 < title_set) {
+@@ -1477,7 +1477,9 @@
+ 	if ((streamout_ifo = open(targetname_ifo, O_WRONLY | O_CREAT | O_TRUNC, 0666)) == -1) {
+ 		fprintf(stderr, _("Error creating %s\n"), targetname_ifo);
+ 		perror(PACKAGE);
+-		ifoClose(ifo_file);
++		if (ifo_file) {
++			DVDCloseFile(ifo_file);
++		}
+ 		free(buffer);
+ 		free(targetname_ifo);
+ 		free(targetname_bup);
+@@ -1489,7 +1491,9 @@
+ 	if ((streamout_bup = open(targetname_bup, O_WRONLY | O_CREAT | O_TRUNC, 0666)) == -1) {
+ 		fprintf(stderr, _("Error creating %s\n"), targetname_bup);
+ 		perror(PACKAGE);
+-		ifoClose(ifo_file);
++		if (ifo_file) {
++			DVDCloseFile(ifo_file);
++		}
+ 		free(buffer);
+ 		free(targetname_ifo);
+ 		free(targetname_bup);
+@@ -1500,9 +1504,11 @@
+ 
+ 	/* Copy VIDEO_TS.IFO, since it's a small file try to copy it in one shot */
+ 
+-	if ((ifo_file = ifoOpen(dvd, title_set))== 0) {
++	if ((ifo_file = DVDOpenFile(dvd, title_set, DVD_READ_INFO_FILE))== 0) {
+ 		fprintf(stderr, _("Failed opening IFO for title set %d\n"), title_set);
+-		ifoClose(ifo_file);
++		if (ifo_file) {
++			DVDCloseFile(ifo_file);
++		}
+ 		free(buffer);
+ 		free(targetname_ifo);
+ 		free(targetname_bup);
+@@ -1511,11 +1517,13 @@
+ 		return 1;
+ 	}
+ 
+-	size = DVDFileSize(ifo_file->file) * DVD_VIDEO_LB_LEN;
++	size = DVDFileSize(ifo_file) * DVD_VIDEO_LB_LEN;
+ 
+ 	if ((buffer = (unsigned char *)malloc(size * sizeof(unsigned char))) == NULL) {
+ 		perror(PACKAGE);
+-		ifoClose(ifo_file);
++		if (ifo_file) {
++			DVDCloseFile(ifo_file);
++		}
+ 		free(buffer);
+ 		free(targetname_ifo);
+ 		free(targetname_bup);
+@@ -1524,11 +1532,13 @@
+ 		return 1;
+ 	}
+ 
+-	DVDFileSeek(ifo_file->file, 0);
++	DVDFileSeek(ifo_file, 0);
+ 
+-	if (DVDReadBytes(ifo_file->file,buffer,size) != size) {
++	if (DVDReadBytes(ifo_file,buffer,size) != size) {
+ 		fprintf(stderr, _("Error reading IFO for title set %d\n"), title_set);
+-		ifoClose(ifo_file);
++		if (ifo_file) {
++			DVDCloseFile(ifo_file);
++		}
+ 		free(buffer);
+ 		free(targetname_ifo);
+ 		free(targetname_bup);
+@@ -1540,7 +1550,9 @@
+ 
+ 	if (write(streamout_ifo,buffer,size) != size) {
+ 		fprintf(stderr, _("Error writing %s\n"),targetname_ifo);
+-		ifoClose(ifo_file);
++		if (ifo_file) {
++			DVDCloseFile(ifo_file);
++		}
+ 		free(buffer);
+ 		free(targetname_ifo);
+ 		free(targetname_bup);
+@@ -1551,7 +1563,9 @@
+ 
+ 	if (write(streamout_bup,buffer,size) != size) {
+ 		fprintf(stderr, _("Error writing %s\n"),targetname_bup);
+-		ifoClose(ifo_file);
++		if (ifo_file) {
++			DVDCloseFile(ifo_file);
++		}
+ 		free(buffer);
+ 		free(targetname_ifo);
+ 		free(targetname_bup);
+@@ -1559,6 +1573,9 @@
+ 		close(streamout_bup);
+ 		return 1;
+ 	}
++	if (ifo_file) {
++		DVDCloseFile(ifo_file);
++	}
+ 
+ 	free(targetname_ifo);
+ 	free(targetname_bup);
