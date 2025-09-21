@@ -28,6 +28,8 @@
 extern int verbose;
 extern int aspect;
 extern int progress;
+extern int fill_gaps;
+extern int no_overwrite;
 
 typedef enum {
 	STRATEGY_ABORT,

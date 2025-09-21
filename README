@@ -23,6 +23,14 @@ General backup information:
 	original. This means that every file will be have the same size as the
 	original one. Like wise goes also for the -F and the -T switch.
 
+	If you rerun dvdbackup in a directory that already contains a partial
+	backup, add the --gaps option to verify existing blocks against the DVD,
+	fill in blank ones, truncate any extra trailing data, and print the
+	percentage of blank sectors before and after the refresh instead of
+	rewriting everything.
+	Use the --no-overwrite flag to abort instead of touching an existing
+	title directory.
+
 	However the -t and (-t -s/-e) switch is a bit different the titles
 	sectors will be written to the original file but not at the same offset
 	as the original one since they may be gaps in the cell structure that we

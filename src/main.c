@@ -102,8 +102,10 @@ Print a friendly, customizable greeting.\n"), stdout); */
   -a, --aspect=0           to get aspect ratio 4:3 instead of 16:9 if both are\n\
                            present\n\
   -r, --error={a,b,m}      select read error handling: a=abort, b=skip block,\n\
-                           m=skip multiple blocks (default)\n\
-  -p, --progress           print progress information while copying VOBs\n\n"));
+                          m=skip multiple blocks (default)\n\
+  -p, --progress           print progress information while copying VOBs\n\
+      --gaps               verify existing output and fill missing blocks\n\
+      --no-overwrite       abort if the target title directory already exists\n\n"));
 
 	printf(_("\
   -a is option to the -F switch and has no effect on other options\n\
@@ -199,9 +201,11 @@ int main(int argc, char* argv[]) {
 		{"aspect", required_argument, NULL, 'a'},
 		{"error", required_argument, NULL, 'r'},
 		{"progress", no_argument, NULL, 'p'},
+		{"gaps", no_argument, NULL, 'G'},
+		{"no-overwrite", no_argument, NULL, 'O'},
 		{NULL, 0, NULL, 0}
 	};
-	const char* shortopts = "hVIMFT:t:s:e:i:o:vn:a:r:p";
+	const char* shortopts = "hVIMFT:t:s:e:i:o:vn:a:r:pGO";
 
 	init_i18n();
 	program_name = argv[0];
@@ -261,6 +265,12 @@ int main(int argc, char* argv[]) {
 			break;
 		case 'p':
 			progress = 1;
+			break;
+		case 'G':
+			fill_gaps = 1;
+			break;
+		case 'O':
+			no_overwrite = 1;
 			break;
 
 		default:
@@ -433,6 +443,11 @@ int main(int argc, char* argv[]) {
 	if (stat(targetname, &fileinfo) == 0) {
 		if (! S_ISDIR(fileinfo.st_mode)) {
 			fprintf(stderr,_("The title directory is not valid; it may be an ordinary file.\n"));
+		} else if (no_overwrite) {
+			fprintf(stderr, _("The title directory %s exists; rerun without --no-overwrite.\n"), targetname);
+			free(targetname);
+			DVDClose(_dvd);
+			exit(-1);
 		}
 	} else {
 		if (mkdir(targetname, 0777) != 0) {
@@ -448,6 +463,11 @@ int main(int argc, char* argv[]) {
 	if (stat(targetname, &fileinfo) == 0) {
 		if (! S_ISDIR(fileinfo.st_mode)) {
 			fprintf(stderr,_("The VIDEO_TS directory is not valid; it may be an ordinary file.\n"));
+		} else if (no_overwrite) {
+			fprintf(stderr, _("The VIDEO_TS directory %s exists; rerun without --no-overwrite.\n"), targetname);
+			free(targetname);
+			DVDClose(_dvd);
+			exit(-1);
 		}
 	} else {
 		if (mkdir(targetname, 0777) != 0) {

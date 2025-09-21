@@ -28,9 +28,11 @@
 /* C standard libraries */
 #include <ctype.h>
 #include <limits.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* C POSIX library */
 #include <fcntl.h>
@@ -63,6 +65,8 @@ int verbose = 0;
 int aspect;
 int progress = 0;
 char progressText[MAXNAME] = "n/a";
+int fill_gaps = 0;
+int no_overwrite = 0;
 
 /* Structs to keep title set information in */
 
@@ -99,6 +103,116 @@ typedef struct {
 
 
 static void bsort_max_to_min(int sector[], int title[], int size);
+
+
+static int buffer_is_blank(const unsigned char* buffer, size_t length) {
+	size_t i;
+
+	for (i = 0; i < length; ++i) {
+		if (buffer[i] != 0x00) {
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+
+static void report_gap_stats(const char* path, size_t total_blocks, size_t blank_before, size_t blank_after) {
+	if (!fill_gaps) {
+		return;
+	}
+
+	if (total_blocks == 0) {
+		printf(_("Gaps stats for %s: no sectors examined\n"), path);
+		return;
+	}
+
+	double before_pct = ((double)blank_before * 100.0) / (double)total_blocks;
+	double after_pct = ((double)blank_after * 100.0) / (double)total_blocks;
+
+	printf(_("Gaps stats for %s: blank before %.2f%%, after %.2f%%\n"), path, before_pct, after_pct);
+}
+
+
+static int finalize_vob_file(int streamout, const char* path, size_t size_blocks,
+		size_t total_blocks, size_t blank_before, size_t blank_after) {
+	off_t target_size;
+
+	if (streamout == -1) {
+		return 0;
+	}
+
+	target_size = (off_t)size_blocks * DVD_VIDEO_LB_LEN;
+	if (ftruncate(streamout, target_size) != 0) {
+		fprintf(stderr, _("Failed to truncate %s\n"), path);
+		perror(PACKAGE);
+		return -1;
+	}
+
+	report_gap_stats(path, total_blocks, blank_before, blank_after);
+
+	return 0;
+}
+
+
+static ssize_t read_existing_range(int fd, off_t offset, unsigned char* buffer, size_t length) {
+	size_t total = 0;
+
+	if (length == 0) {
+		return 0;
+	}
+
+	if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
+		return -1;
+	}
+
+	while (total < length) {
+		ssize_t read_now = read(fd, buffer + total, length - total);
+		if (read_now < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -1;
+		}
+		if (read_now == 0) {
+			break;
+		}
+		total += (size_t)read_now;
+	}
+
+	if (total < length) {
+		memset(buffer + total, 0x00, length - total);
+	}
+
+	return (ssize_t)total;
+}
+
+
+static int write_range(int fd, off_t offset, const unsigned char* data, size_t length) {
+	size_t total = 0;
+
+	if (length == 0) {
+		return 0;
+	}
+
+	if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
+		return -1;
+	}
+
+	while (total < length) {
+		ssize_t written = write(fd, data + total, length - total);
+		if (written < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -1;
+		}
+		total += (size_t)written;
+	}
+
+	return 0;
+}
 
 
 static int CheckSizeArray(const int size_array[], int reference, int target) {
@@ -179,37 +293,36 @@ static int DVDWriteCells(dvd_reader_t * dvd, int cell_start_sector[],
 	int vob = 1;
 
 	/* Temp filename,dirname */
-	char *targetname;
+	char *targetname = NULL;
 	size_t targetname_length;
 
-	/* Write buffer */
-
-	unsigned char * buffer=NULL;
+	/* Write buffers */
+	unsigned char *buffer = NULL;
+	unsigned char *existing_buffer = NULL;
 
 	/* File Handler */
-	int streamout;
+	int streamout = -1;
 
 	int size;
 	int left;
-
 	int to_read;
 	int have_read;
-
-	/* Offsets */
 	int soffset;
-
 
 	/* DVD handler */
 	dvd_file_t* dvd_file = NULL;
 
 	int title_set;
+	int result = 1;
+	int open_flags;
+	size_t vob_total_blocks = 0;
+	size_t vob_blank_before = 0;
+	size_t vob_blank_after = 0;
 
 #ifdef DEBUG
 	int number_of_vob_files;
-
 	fprintf(stderr,"DVDWriteCells: length is %d\n", length);
 #endif
-
 
 	title_set = titles_info->titles[titles - 1].title_set;
 #ifdef DEBUG
@@ -223,22 +336,22 @@ static int DVDWriteCells(dvd_reader_t * dvd, int cell_start_sector[],
 	targetname = malloc(targetname_length);
 	if (targetname == NULL) {
 		fprintf(stderr, _("Failed to allocate %zu bytes for a filename.\n"), targetname_length);
-		return 1;
+		goto cleanup;
 	}
 
 	/* Remove all old files silently if they exists */
-
-	for ( i = 0 ; i < 10 ; i++ ) {
-		snprintf(targetname, targetname_length, "%s/%s/VIDEO_TS/VTS_%02i_%i.VOB", targetdir, title_name, title_set, i + 1);
+	if (!fill_gaps) {
+		for (i = 0; i < 10; i++) {
+			snprintf(targetname, targetname_length, "%s/%s/VIDEO_TS/VTS_%02i_%i.VOB", targetdir, title_name, title_set, i + 1);
 #ifdef DEBUG
-		fprintf(stderr,"DVDWriteCells: file is %s\n", targetname);
+			fprintf(stderr,"DVDWriteCells: file is %s\n", targetname);
 #endif
-		unlink( targetname);
+			unlink(targetname);
+		}
 	}
 
-
 #ifdef DEBUG
-	for (i = 0; i < number_of_vob_files ; i++) {
+	for (i = 0; i < number_of_vob_files; i++) {
 		fprintf(stderr,"vob %i size: %lld\n", i + 1, title_set_info->title_set[title_set].size_vob[i]);
 	}
 #endif
@@ -246,8 +359,7 @@ static int DVDWriteCells(dvd_reader_t * dvd, int cell_start_sector[],
 	/* Create VTS_XX_X.VOB */
 	if (title_set == 0) {
 		fprintf(stderr,_("Do not try to copy chapters from the VMG domain; there are none.\n"));
-		free(targetname);
-		return(1);
+		goto cleanup;
 	} else {
 		snprintf(targetname, targetname_length, "%s/%s/VIDEO_TS/VTS_%02i_%i.VOB", targetdir, title_name, title_set, vob);
 	}
@@ -256,44 +368,49 @@ static int DVDWriteCells(dvd_reader_t * dvd, int cell_start_sector[],
 	fprintf(stderr,"DVDWriteCells: 1\n");
 #endif
 
-	if ((buffer = (unsigned char *)malloc(BUFFER_SIZE * DVD_VIDEO_LB_LEN * sizeof(unsigned char))) == NULL) {
+	buffer = (unsigned char *)malloc(BUFFER_SIZE * DVD_VIDEO_LB_LEN * sizeof(unsigned char));
+	if (buffer == NULL) {
 		fprintf(stderr, _("Out of memory copying %s\n"), targetname);
-		free(targetname);
-		return(1);
+		goto cleanup;
 	}
 
 #ifdef DEBUG
 	fprintf(stderr,"DVDWriteCells: 2\n");
 #endif
 
+	if (fill_gaps) {
+		existing_buffer = (unsigned char *)malloc(BUFFER_SIZE * DVD_VIDEO_LB_LEN * sizeof(unsigned char));
+		if (existing_buffer == NULL) {
+			fprintf(stderr, _("Out of memory copying %s\n"), targetname);
+			goto cleanup;
+		}
+	}
 
-	if ((streamout = open(targetname, O_WRONLY | O_CREAT | O_APPEND, 0666)) == -1) {
+	open_flags = fill_gaps ? (O_RDWR | O_CREAT) : (O_WRONLY | O_CREAT | O_APPEND);
+	streamout = open(targetname, open_flags, 0666);
+	if (streamout == -1) {
 		fprintf(stderr, _("Error creating %s\n"), targetname);
 		perror(PACKAGE);
-		free(targetname);
-		return(1);
+		goto cleanup;
 	}
 
 #ifdef DEBUG
 	fprintf(stderr,"DVDWriteCells: 3\n");
 #endif
 
-
-	if ((dvd_file = DVDOpenFile(dvd, title_set, DVD_READ_TITLE_VOBS))== 0) {
+	dvd_file = DVDOpenFile(dvd, title_set, DVD_READ_TITLE_VOBS);
+	if (dvd_file == 0) {
 		fprintf(stderr, _("Failed opening TITLE VOB\n"));
-		free(buffer);
-		close(streamout);
-		free(targetname);
-		return(1);
+		goto cleanup;
 	}
 
 	size = 0;
 
-	for (i=0; i<length; i++) {
+	for (i = 0; i < length; i++) {
 		left = cell_end_sector[i] - cell_start_sector[i];
 		soffset = cell_start_sector[i];
 
-		while(left > 0) {
+		while (left > 0) {
 			to_read = left;
 			if (to_read + size > MAX_VOB_SIZE) {
 				to_read = MAX_VOB_SIZE - size;
@@ -302,24 +419,115 @@ static int DVDWriteCells(dvd_reader_t * dvd, int cell_start_sector[],
 				to_read = BUFFER_SIZE;
 			}
 
-			if ((have_read = DVDReadBlocks(dvd_file,soffset, to_read, buffer)) < 0) {
-				fprintf(stderr, _("Error reading MENU VOB: %d != %d\n"), have_read, to_read);
-				free(buffer);
-				DVDCloseFile(dvd_file);
-				close(streamout);
-				free(targetname);
-				return(1);
+			have_read = DVDReadBlocks(dvd_file, soffset, to_read, buffer);
+			if (have_read < 0) {
+				fprintf(stderr, _("Error reading TITLE VOB: %d != %d\n"), have_read, to_read);
+				result = 1;
+				goto cleanup;
+			}
+			if (have_read == 0) {
+				fprintf(stderr, _("Error reading TITLE VOB: no data read\n"));
+				result = 1;
+				goto cleanup;
 			}
 			if (have_read < to_read) {
 				fprintf(stderr, _("DVDReadBlocks read %d blocks of %d blocks\n"), have_read, to_read);
 			}
-			if (write(streamout, buffer, have_read * DVD_VIDEO_LB_LEN) != have_read * DVD_VIDEO_LB_LEN) {
-				fprintf(stderr, _("Error writing TITLE VOB\n"));
-				free(buffer);
-				close(streamout);
-				free(targetname);
-				return(1);
+
+		if (fill_gaps) {
+			size_t chunk_blocks = (size_t)have_read;
+			size_t chunk_bytes = chunk_blocks * DVD_VIDEO_LB_LEN;
+			off_t chunk_offset = (off_t)size * DVD_VIDEO_LB_LEN;
+			ssize_t existing_bytes = read_existing_range(streamout, chunk_offset, existing_buffer, chunk_bytes);
+			if (existing_bytes < 0) {
+					fprintf(stderr, _("Error reading existing data from %s\n"), targetname);
+					perror(PACKAGE);
+					result = 1;
+					goto cleanup;
+				}
+
+				size_t block_size = DVD_VIDEO_LB_LEN;
+				size_t existing_blocks = (size_t)existing_bytes / block_size;
+				size_t partial_bytes = (size_t)existing_bytes % block_size;
+				size_t pending_start = SIZE_MAX;
+
+				for (size_t block_idx = 0; block_idx < chunk_blocks; ++block_idx) {
+					unsigned char* existing_block = existing_buffer + block_idx * block_size;
+					const unsigned char* dvd_block = buffer + block_idx * block_size;
+					int block_has_full = (block_idx < existing_blocks);
+					int block_has_partial = (!block_has_full && (block_idx == existing_blocks) && (partial_bytes > 0));
+					int block_blank;
+					int after_blank = buffer_is_blank(dvd_block, block_size);
+
+					if (block_has_full) {
+						block_blank = buffer_is_blank(existing_block, block_size);
+						if (!block_blank) {
+							if (memcmp(existing_block, dvd_block, block_size) != 0) {
+								fprintf(stderr, _("Existing data in %s does not match the DVD at offset %lld\n"), targetname, (long long)(chunk_offset + (off_t)block_idx * block_size));
+								result = 1;
+								goto cleanup;
+							}
+						}
+					} else if (block_has_partial) {
+						block_blank = buffer_is_blank(existing_block, partial_bytes);
+						if (!block_blank) {
+							if (memcmp(existing_block, dvd_block, partial_bytes) != 0) {
+								fprintf(stderr, _("Existing data in %s does not match the DVD at offset %lld\n"), targetname, (long long)(chunk_offset + (off_t)block_idx * block_size));
+								result = 1;
+								goto cleanup;
+							}
+						}
+					} else {
+						block_blank = 1;
+					}
+
+					vob_total_blocks++;
+					if (block_blank) {
+						vob_blank_before++;
+					}
+					if (after_blank) {
+						vob_blank_after++;
+					}
+
+					if (block_blank) {
+						if (pending_start == SIZE_MAX) {
+							pending_start = block_idx;
+						}
+					} else if (pending_start != SIZE_MAX) {
+						size_t pending_blocks = block_idx - pending_start;
+						off_t write_offset = chunk_offset + (off_t)pending_start * block_size;
+						size_t bytes_to_write = pending_blocks * block_size;
+						if (write_range(streamout, write_offset, buffer + pending_start * block_size, bytes_to_write) != 0) {
+							fprintf(stderr, _("Error writing TITLE VOB\n"));
+							perror(PACKAGE);
+							result = 1;
+							goto cleanup;
+						}
+						pending_start = SIZE_MAX;
+					}
+				}
+
+				if (pending_start != SIZE_MAX) {
+					size_t pending_blocks = chunk_blocks - pending_start;
+					off_t write_offset = chunk_offset + (off_t)pending_start * block_size;
+					size_t bytes_to_write = pending_blocks * block_size;
+					if (write_range(streamout, write_offset, buffer + pending_start * block_size, bytes_to_write) != 0) {
+						fprintf(stderr, _("Error writing TITLE VOB\n"));
+						perror(PACKAGE);
+						result = 1;
+						goto cleanup;
+					}
+				}
+			} else {
+				if (write(streamout, buffer, have_read * DVD_VIDEO_LB_LEN) != have_read * DVD_VIDEO_LB_LEN) {
+					fprintf(stderr, _("Error writing TITLE VOB\n"));
+					perror(PACKAGE);
+					result = 1;
+					goto cleanup;
+				}
 			}
+
+
 #ifdef DEBUG
 			fprintf(stderr,"Current soffset changed from %i to ",soffset);
 #endif
@@ -327,32 +535,57 @@ static int DVDWriteCells(dvd_reader_t * dvd, int cell_start_sector[],
 #ifdef DEBUG
 			fprintf(stderr,"%i\n",soffset);
 #endif
-			left = left - have_read;
-			size = size + have_read;
+			left -= have_read;
+			size += have_read;
+
 			if ((size >= MAX_VOB_SIZE) && (left > 0)) {
 #ifdef DEBUG
 				fprintf(stderr,"size: %i, MAX_VOB_SIZE: %i\n ",size, MAX_VOB_SIZE);
 #endif
+				if (finalize_vob_file(streamout, targetname, (size_t)size,
+						vob_total_blocks, vob_blank_before, vob_blank_after) != 0) {
+					result = 1;
+					goto cleanup;
+				}
 				close(streamout);
+				streamout = -1;
 				vob = vob + 1;
 				size = 0;
+				vob_total_blocks = 0;
+				vob_blank_before = 0;
+				vob_blank_after = 0;
 				snprintf(targetname, targetname_length, "%s/%s/VIDEO_TS/VTS_%02i_%i.VOB", targetdir, title_name, title_set, vob);
-				if ((streamout = open(targetname, O_WRONLY | O_CREAT | O_APPEND, 0666)) == -1) {
+				streamout = open(targetname, open_flags, 0666);
+				if (streamout == -1) {
 					fprintf(stderr, _("Error creating %s\n"), targetname);
 					perror(PACKAGE);
-					free(targetname);
-					return(1);
+					result = 1;
+					goto cleanup;
 				}
 			}
 		}
 	}
 
-	DVDCloseFile(dvd_file);
+	if (finalize_vob_file(streamout, targetname, (size_t)size,
+			vob_total_blocks, vob_blank_before, vob_blank_after) != 0) {
+		result = 1;
+		goto cleanup;
+	}
+
+	result = 0;
+
+cleanup:
+	if (dvd_file) {
+		DVDCloseFile(dvd_file);
+	}
+	if (streamout != -1) {
+		close(streamout);
+	}
+	free(existing_buffer);
 	free(buffer);
-	close(streamout);
 	free(targetname);
 
-	return(0);
+	return result;
 }
 
 
