@@ -86,8 +86,9 @@ m=skip multiple blocks (default)
 print progress information while copying VOBs
 .TP
 .B \-\-gaps
-verify existing backup files against the DVD, copy only blank blocks,
-truncate oversized outputs, and report blank-sector percentages before and after
+sample existing backup files against the DVD, report how many sectors were
+zero-filled or missing before and after the refresh, print how many sectors
+were refilled, and refill only those gaps without truncating matching content
 .TP
 .B \-\-no-overwrite
 abort if the target title directory already exists

@@ -58,6 +58,9 @@
  */
 #define MAX_VOB_SIZE 524288
 
+/* Number of verification samples to collect when refreshing with --gaps. */
+#define GAP_SAMPLE_TARGET 32
+
 #define DVD_SEC_SIZ 2048
 
 /* Flag for verbose mode */
@@ -143,6 +146,10 @@ static int finalize_vob_file(int streamout, const char* path, size_t size_blocks
 		return 0;
 	}
 
+	if (fill_gaps) {
+		return 0;
+	}
+
 	target_size = (off_t)size_blocks * DVD_VIDEO_LB_LEN;
 	if (ftruncate(streamout, target_size) != 0) {
 		fprintf(stderr, _("Failed to truncate %s\n"), path);
@@ -212,6 +219,402 @@ static int write_range(int fd, off_t offset, const unsigned char* data, size_t l
 	}
 
 	return 0;
+}
+
+typedef struct {
+	size_t start_block;
+	size_t block_count;
+} gap_range_t;
+
+typedef struct {
+	gap_range_t* ranges;
+	size_t count;
+	size_t capacity;
+} gap_plan_t;
+
+
+static void gap_plan_free(gap_plan_t* plan) {
+	free(plan->ranges);
+	plan->ranges = NULL;
+	plan->count = 0;
+	plan->capacity = 0;
+}
+
+
+static int gap_plan_add(gap_plan_t* plan, size_t start, size_t count) {
+	gap_range_t* last;
+	size_t last_end;
+	gap_range_t* new_ranges;
+	size_t new_capacity;
+
+	if (count == 0) {
+		return 0;
+	}
+
+	if (plan->count > 0) {
+		last = &plan->ranges[plan->count - 1];
+		last_end = last->start_block + last->block_count;
+		if (start <= last_end) {
+			size_t new_end = start + count;
+			if (new_end > last_end) {
+				last->block_count = new_end - last->start_block;
+			}
+			return 0;
+		}
+	}
+
+	if (plan->count == plan->capacity) {
+		new_capacity = plan->capacity == 0 ? 8 : plan->capacity * 2;
+		if (new_capacity < plan->count + 1) {
+			new_capacity = plan->count + 1;
+		}
+		new_ranges = realloc(plan->ranges, new_capacity * sizeof(*new_ranges));
+		if (new_ranges == NULL) {
+			return -1;
+		}
+		plan->ranges = new_ranges;
+		plan->capacity = new_capacity;
+	}
+
+	plan->ranges[plan->count].start_block = start;
+	plan->ranges[plan->count].block_count = count;
+	plan->count++;
+
+	return 0;
+}
+
+
+static int gap_plan_contains(const gap_plan_t* plan, size_t block) {
+	size_t i;
+
+	for (i = 0; i < plan->count; ++i) {
+		const gap_range_t* range = &plan->ranges[i];
+		if (block < range->start_block) {
+			return 0;
+		}
+		if (block < range->start_block + range->block_count) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+
+static int scan_existing_file_for_gaps(int fd, size_t expected_blocks, gap_plan_t* plan,
+		size_t* blank_blocks_out, size_t* full_blocks_out, off_t* existing_bytes_out) {
+	struct stat st;
+	off_t existing_bytes;
+	size_t full_blocks;
+	size_t scan_blocks;
+	unsigned char* buffer = NULL;
+	size_t processed = 0;
+	size_t blank_blocks = 0;
+	size_t pending_start = SIZE_MAX;
+
+	if (fstat(fd, &st) != 0) {
+		return -1;
+	}
+
+	existing_bytes = st.st_size;
+	if (existing_bytes_out) {
+		*existing_bytes_out = existing_bytes;
+	}
+
+	full_blocks = (size_t)(existing_bytes / DVD_VIDEO_LB_LEN);
+	scan_blocks = full_blocks;
+	if (scan_blocks > expected_blocks) {
+		scan_blocks = expected_blocks;
+	}
+
+	if (scan_blocks > 0) {
+		buffer = (unsigned char*)malloc((size_t)BUFFER_SIZE * DVD_VIDEO_LB_LEN);
+		if (buffer == NULL) {
+			return -1;
+		}
+	}
+
+	while (processed < scan_blocks) {
+		size_t chunk_blocks = scan_blocks - processed;
+		ssize_t bytes;
+		size_t have_blocks;
+		size_t i;
+
+		if (chunk_blocks > BUFFER_SIZE) {
+			chunk_blocks = BUFFER_SIZE;
+		}
+
+		bytes = pread(fd, buffer, (size_t)chunk_blocks * DVD_VIDEO_LB_LEN,
+			(off_t)processed * DVD_VIDEO_LB_LEN);
+		if (bytes < 0) {
+			int saved_errno = errno;
+			free(buffer);
+			errno = saved_errno;
+			return -1;
+		}
+
+		have_blocks = (size_t)bytes / DVD_VIDEO_LB_LEN;
+		if (have_blocks == 0) {
+			break;
+		}
+		if (have_blocks < chunk_blocks) {
+			chunk_blocks = have_blocks;
+		}
+
+		for (i = 0; i < chunk_blocks; ++i) {
+			size_t block_index = processed + i;
+			const unsigned char* block_ptr = buffer + i * DVD_VIDEO_LB_LEN;
+
+			if (buffer_is_blank(block_ptr, DVD_VIDEO_LB_LEN)) {
+				if (pending_start == SIZE_MAX) {
+					pending_start = block_index;
+				}
+			} else if (pending_start != SIZE_MAX) {
+				size_t run = block_index - pending_start;
+				if (gap_plan_add(plan, pending_start, run) != 0) {
+					free(buffer);
+					return -1;
+				}
+				blank_blocks += run;
+				pending_start = SIZE_MAX;
+			}
+		}
+
+		processed += chunk_blocks;
+	}
+
+	if (pending_start != SIZE_MAX) {
+		size_t run = scan_blocks - pending_start;
+		if (gap_plan_add(plan, pending_start, run) != 0) {
+			free(buffer);
+			return -1;
+		}
+		blank_blocks += run;
+	}
+
+	free(buffer);
+
+	if (blank_blocks_out) {
+		*blank_blocks_out = blank_blocks;
+	}
+	if (full_blocks_out) {
+		*full_blocks_out = full_blocks;
+	}
+
+	return 0;
+}
+
+
+static size_t gap_collect_samples(const gap_plan_t* plan, size_t available_blocks,
+		size_t desired, size_t samples[]) {
+	size_t target;
+	size_t count = 0;
+	size_t i;
+
+	if (available_blocks == 0 || desired == 0) {
+		return 0;
+	}
+
+	target = desired;
+	if (available_blocks < desired) {
+		target = available_blocks;
+	}
+
+	for (i = 0; i < target; ++i) {
+		size_t candidate = (size_t)(((uint64_t)(i + 1) * (uint64_t)available_blocks) / (target + 1));
+		size_t forward = candidate;
+		size_t backward;
+
+		if (candidate >= available_blocks) {
+			candidate = available_blocks - 1;
+		}
+
+		while (forward < available_blocks && gap_plan_contains(plan, forward)) {
+			forward++;
+		}
+		if (forward >= available_blocks) {
+			backward = candidate;
+			while (backward > 0 && gap_plan_contains(plan, backward)) {
+				backward--;
+			}
+			if (gap_plan_contains(plan, backward)) {
+				continue;
+			}
+			forward = backward;
+		}
+
+		if (count > 0 && samples[count - 1] == forward) {
+			continue;
+		}
+
+		samples[count++] = forward;
+	}
+
+	return count;
+}
+
+
+static int gap_verify_samples(int fd, dvd_file_t* dvd_file, int dvd_offset,
+		const char* filename, const size_t samples[], size_t sample_count) {
+	unsigned char dvd_block[DVD_VIDEO_LB_LEN];
+	unsigned char file_block[DVD_VIDEO_LB_LEN];
+	size_t i;
+	ssize_t read_bytes;
+
+	for (i = 0; i < sample_count; ++i) {
+		size_t block = samples[i];
+
+		if (DVDReadBlocks(dvd_file, dvd_offset + (int)block, 1, dvd_block) != 1) {
+			fprintf(stderr, _("Error reading %s at block %zu during verification\n"), filename, block);
+			return 1;
+		}
+
+		read_bytes = pread(fd, file_block, DVD_VIDEO_LB_LEN, (off_t)block * DVD_VIDEO_LB_LEN);
+		if (read_bytes != DVD_VIDEO_LB_LEN) {
+			fprintf(stderr, _("Error reading existing data from %s during verification\n"), filename);
+			perror(PACKAGE);
+			return 1;
+		}
+
+		if (memcmp(dvd_block, file_block, DVD_VIDEO_LB_LEN) != 0) {
+			fprintf(stderr, _("Verification sample mismatch for %s at sector %zu\n"), filename, block);
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+
+static int gap_fill_from_plan(int fd, dvd_file_t* dvd_file, int dvd_offset,
+		const gap_plan_t* plan, const char* filename,
+		read_error_strategy_t errorstrat, size_t* filled_blocks_out) {
+	unsigned char* buffer;
+	size_t range_index;
+	size_t total_filled = 0;
+
+	if (plan->count == 0) {
+		if (filled_blocks_out) {
+			*filled_blocks_out = 0;
+		}
+		return 0;
+	}
+
+	buffer = (unsigned char*)malloc((size_t)BUFFER_SIZE * DVD_VIDEO_LB_LEN);
+	if (buffer == NULL) {
+		if (filled_blocks_out) {
+			*filled_blocks_out = 0;
+		}
+		return 1;
+	}
+
+	for (range_index = 0; range_index < plan->count; ++range_index) {
+		size_t start = plan->ranges[range_index].start_block;
+		size_t remaining = plan->ranges[range_index].block_count;
+
+		while (remaining > 0) {
+			size_t chunk = remaining;
+			int blocks_read;
+			size_t usable_blocks = 0;
+			size_t skip_blocks = 0;
+			ssize_t written;
+
+			if (chunk > BUFFER_SIZE) {
+				chunk = BUFFER_SIZE;
+			}
+
+			blocks_read = DVDReadBlocks(dvd_file, dvd_offset + (int)start, (int)chunk, buffer);
+			if (blocks_read == (int)chunk) {
+				usable_blocks = chunk;
+			} else if (blocks_read > 0) {
+				usable_blocks = (size_t)blocks_read;
+				fprintf(stderr, _("Gap fill warning for %s: read %d of %zu blocks at %zu\n"),
+					filename, blocks_read, chunk, start);
+			} else {
+				fprintf(stderr, _("Gap fill error for %s: read failure at block %zu\n"), filename, start);
+			}
+
+			if (usable_blocks > 0) {
+				written = pwrite(fd, buffer, usable_blocks * DVD_VIDEO_LB_LEN,
+						(off_t)start * DVD_VIDEO_LB_LEN);
+				if (written != (ssize_t)(usable_blocks * DVD_VIDEO_LB_LEN)) {
+					fprintf(stderr, _("Error writing %s during gap fill\n"), filename);
+					perror(PACKAGE);
+					free(buffer);
+					if (filled_blocks_out) {
+						*filled_blocks_out = total_filled;
+					}
+					return 1;
+				}
+
+				total_filled += usable_blocks;
+				start += usable_blocks;
+				remaining -= usable_blocks;
+			}
+
+			if (usable_blocks == chunk) {
+				continue;
+			}
+
+			if (remaining == 0) {
+				continue;
+			}
+
+			if (errorstrat == STRATEGY_ABORT) {
+				free(buffer);
+				if (filled_blocks_out) {
+					*filled_blocks_out = total_filled;
+				}
+				return 1;
+			} else if (errorstrat == STRATEGY_SKIP_BLOCK) {
+				skip_blocks = 1;
+				fprintf(stderr, _("Gap fill: skipping single block for %s\n"), filename);
+			} else {
+				size_t unread = chunk - usable_blocks;
+				if (unread == 0) {
+					unread = 1;
+				}
+				skip_blocks = unread;
+				fprintf(stderr, _("Gap fill: skipping %zu blocks for %s\n"), skip_blocks, filename);
+			}
+
+			if (skip_blocks > remaining) {
+				skip_blocks = remaining;
+			}
+
+			start += skip_blocks;
+			remaining -= skip_blocks;
+		}
+	}
+
+	free(buffer);
+	if (filled_blocks_out) {
+		*filled_blocks_out = total_filled;
+	}
+	return 0;
+}
+
+
+static void gap_print_report(const char* path, size_t expected_blocks,
+		size_t blank_before, size_t truncated_before,
+		size_t blank_after, size_t truncated_after,
+		size_t filled_blocks) {
+	double blank_pct_before = 0.0;
+	double trunc_pct_before = 0.0;
+	double blank_pct_after = 0.0;
+	double trunc_pct_after = 0.0;
+
+	if (expected_blocks > 0) {
+		blank_pct_before = (double)blank_before * 100.0 / (double)expected_blocks;
+		trunc_pct_before = (double)truncated_before * 100.0 / (double)expected_blocks;
+		blank_pct_after = (double)blank_after * 100.0 / (double)expected_blocks;
+		trunc_pct_after = (double)truncated_after * 100.0 / (double)expected_blocks;
+	}
+
+	printf(_("Gaps report for %s: filled %zu sectors; before %zu zeroed (%.2f%%), %zu missing (%.2f%%); after %zu zeroed (%.2f%%), %zu missing (%.2f%%)\n"),
+		path, filled_blocks,
+		blank_before, blank_pct_before, truncated_before, trunc_pct_before,
+		blank_after, blank_pct_after, truncated_after, trunc_pct_after);
 }
 
 
@@ -1058,8 +1461,92 @@ static titles_info_t * DVDGetInfo(dvd_reader_t * _dvd) {
 }
 
 
-static int DVDCopyBlocks(dvd_file_t* dvd_file, int destination, int offset, int size, char* filename, read_error_strategy_t errorstrat) {
+static int DVDCopyBlocksFillGaps(dvd_file_t* dvd_file, int destination, int offset,
+		int size, const char* path, const char* label, read_error_strategy_t errorstrat) {
+	gap_plan_t plan = {0};
+	size_t blank_blocks = 0;
+	size_t existing_blocks = 0;
+	off_t existing_bytes = 0;
+	size_t truncated_blocks = 0;
+	size_t sample_slots[GAP_SAMPLE_TARGET];
+	size_t sample_count;
+	int result = 0;
+
+	if (scan_existing_file_for_gaps(destination, (size_t)size, &plan,
+			&blank_blocks, &existing_blocks, &existing_bytes) != 0) {
+		perror(PACKAGE);
+		gap_plan_free(&plan);
+		return 1;
+	}
+
+	if ((size_t)size < existing_blocks) {
+		existing_blocks = (size_t)size;
+	}
+
+	if ((size_t)size > existing_blocks) {
+		size_t missing = (size_t)size - existing_blocks;
+		if (gap_plan_add(&plan, existing_blocks, missing) != 0) {
+			gap_plan_free(&plan);
+			return 1;
+		}
+		truncated_blocks = missing;
+	}
+
+	sample_count = gap_collect_samples(&plan, (size_t)size, GAP_SAMPLE_TARGET, sample_slots);
+	if (sample_count > 0) {
+		if (gap_verify_samples(destination, dvd_file, offset,
+				label ? label : path, sample_slots, sample_count) != 0) {
+			gap_plan_free(&plan);
+			return 1;
+		}
+	}
+
+	size_t blank_after = blank_blocks;
+	size_t truncated_after = truncated_blocks;
+	size_t filled_blocks = 0;
+	int fill_status = gap_fill_from_plan(destination, dvd_file, offset, &plan,
+			label ? label : path, errorstrat, &filled_blocks);
+
+	gap_plan_free(&plan);
+
+	if (fill_status == 0) {
+		gap_plan_t verify_plan = (gap_plan_t){0};
+		size_t verify_blank = 0;
+		size_t verify_existing_blocks = 0;
+		off_t verify_bytes = 0;
+
+		if (scan_existing_file_for_gaps(destination, (size_t)size, &verify_plan,
+				&verify_blank, &verify_existing_blocks, &verify_bytes) == 0) {
+			blank_after = verify_blank;
+			if ((size_t)size > verify_existing_blocks) {
+				truncated_after = (size_t)size - verify_existing_blocks;
+			} else {
+				truncated_after = 0;
+			}
+		}
+		gap_plan_free(&verify_plan);
+	}
+
+	gap_print_report(path, (size_t)size,
+			blank_blocks, truncated_blocks,
+			blank_after, truncated_after,
+			filled_blocks);
+
+	if (fill_status != 0) {
+		result = 1;
+	}
+
+	return result;
+}
+
+
+static int DVDCopyBlocks(dvd_file_t* dvd_file, int destination, int offset, int size,
+		const char* path, const char* label, read_error_strategy_t errorstrat) {
 	int i;
+
+	if (fill_gaps) {
+		return DVDCopyBlocksFillGaps(dvd_file, destination, offset, size, path, label, errorstrat);
+	}
 
 	/* all sizes are in DVD logical blocks */
 	int remaining = size;
@@ -1090,9 +1577,9 @@ static int DVDCopyBlocks(dvd_file_t* dvd_file, int destination, int offset, int 
 				fprintf(stdout, "\n");
 			}
 			if(act_read >= 0) {
-				fprintf(stderr, _("Error reading %s at block %d\n"), filename, offset+act_read);
+				fprintf(stderr, _("Error reading %s at block %d\n"), label, offset+act_read);
 			} else {
-				fprintf(stderr, _("Error reading %s at block %d, read error returned\n"), filename, offset);
+				fprintf(stderr, _("Error reading %s at block %d, read error returned\n"), label, offset);
 			}
 		}
 
@@ -1102,7 +1589,7 @@ static int DVDCopyBlocks(dvd_file_t* dvd_file, int destination, int offset, int 
 				if(progress) {
 					fprintf(stdout, "\n");
 				}
-				fprintf(stderr, _("Error writing %s.\n"), filename);
+				fprintf(stderr, _("Error writing %s.\n"), label);
 				return(1);
 			}
 
@@ -1138,7 +1625,7 @@ static int DVDCopyBlocks(dvd_file_t* dvd_file, int destination, int offset, int 
 			}
 
 			if (write(destination, buffer_zero, numBlanks * DVD_VIDEO_LB_LEN) != numBlanks * DVD_VIDEO_LB_LEN) {
-				fprintf(stderr, _("Error writing %s (padding)\n"), filename);
+				fprintf(stderr, _("Error writing %s (padding)\n"), label);
 				return 1;
 			}
 
@@ -1262,23 +1749,28 @@ static int DVDCopyTitleVobX(dvd_reader_t * dvd, title_set_info_t * title_set_inf
 
 
 	if (stat(targetname, &fileinfo) == 0) {
-		/* TRANSLATORS: The sentence starts with "The title file %s exists[...]" */
-		fprintf(stderr, _("The %s %s exists; will try to overwrite it.\n"), _("title file"), targetname);
 		if (! S_ISREG(fileinfo.st_mode)) {
 			/* TRANSLATORS: The sentence starts with "The title file %s is not valid[...]" */
 			fprintf(stderr,_("The %s %s is not valid, it may be a directory.\n"), _("title file"), targetname);
 			free(targetname);
 			return(1);
+		}
+		if (fill_gaps) {
+			fprintf(stderr, _("The %s %s exists; checking for gaps.\n"), _("title file"), targetname);
+			streamout = open(targetname, O_RDWR, 0666);
 		} else {
-			if ((streamout = open(targetname, O_WRONLY | O_TRUNC, 0666)) == -1) {
-				fprintf(stderr, _("Error opening %s\n"), targetname);
-				perror(PACKAGE);
-				free(targetname);
-				return(1);
-			}
+			fprintf(stderr, _("The %s %s exists; truncating before copy.\n"), _("title file"), targetname);
+			streamout = open(targetname, O_WRONLY | O_TRUNC, 0666);
+		}
+		if (streamout == -1) {
+			fprintf(stderr, _("Error opening %s\n"), targetname);
+			perror(PACKAGE);
+			free(targetname);
+			return(1);
 		}
 	} else {
-		if ((streamout = open(targetname, O_WRONLY | O_CREAT, 0666)) == -1) {
+		int create_flags = fill_gaps ? (O_RDWR | O_CREAT) : (O_WRONLY | O_CREAT);
+		if ((streamout = open(targetname, create_flags, 0666)) == -1) {
 			fprintf(stderr, _("Error creating %s\n"), targetname);
 			perror(PACKAGE);
 			free(targetname);
@@ -1293,7 +1785,7 @@ static int DVDCopyTitleVobX(dvd_reader_t * dvd, title_set_info_t * title_set_inf
 		return(1);
 	}
 
-	result = DVDCopyBlocks(dvd_file, streamout, offset, size, filename, errorstrat);
+	result = DVDCopyBlocks(dvd_file, streamout, offset, size, targetname, filename, errorstrat);
 
 	DVDCloseFile(dvd_file);
 	close(streamout);
@@ -1356,25 +1848,31 @@ static int DVDCopyMenu(dvd_reader_t * dvd, title_set_info_t * title_set_info, in
 	snprintf(targetname, targetname_length, "%s/%s/VIDEO_TS/%s", targetdir, title_name, filename);
 
 	if (stat(targetname, &fileinfo) == 0) {
-		/* TRANSLATORS: The sentence starts with "The menu file %s exists[...]" */
-		fprintf(stderr, _("The %s %s exists; will try to overwrite it.\n"), _("menu file"), targetname);
 		if (! S_ISREG(fileinfo.st_mode)) {
 			/* TRANSLATORS: The sentence starts with "The menu file %s is not valid[...]" */
 			fprintf(stderr,_("The %s %s is not valid, it may be a directory.\n"), _("menu file"), targetname);
 			DVDCloseFile(dvd_file);
 			free(targetname);
 			return(1);
+		}
+		if (fill_gaps) {
+			fprintf(stderr, _("The %s %s exists; checking for gaps.\n"), _("menu file"), targetname);
+			streamout = open(targetname, O_RDWR, 0666);
 		} else {
-			if ((streamout = open(targetname, O_WRONLY | O_TRUNC, 0666)) == -1) {
-				fprintf(stderr, _("Error opening %s\n"), targetname);
-				perror(PACKAGE);
-				DVDCloseFile(dvd_file);
-				free(targetname);
-				return(1);
-			}
+			/* TRANSLATORS: The sentence starts with "The menu file %s exists[...]" */
+			fprintf(stderr, _("The %s %s exists; truncating before copy.\n"), _("menu file"), targetname);
+			streamout = open(targetname, O_WRONLY | O_TRUNC, 0666);
+		}
+		if (streamout == -1) {
+			fprintf(stderr, _("Error opening %s\n"), targetname);
+			perror(PACKAGE);
+			DVDCloseFile(dvd_file);
+			free(targetname);
+			return(1);
 		}
 	} else {
-		if ((streamout = open(targetname, O_WRONLY | O_CREAT, 0666)) == -1) {
+		int create_flags = fill_gaps ? (O_RDWR | O_CREAT) : (O_WRONLY | O_CREAT);
+		if ((streamout = open(targetname, create_flags, 0666)) == -1) {
 			fprintf(stderr, _("Error creating %s\n"), targetname);
 			perror(PACKAGE);
 			DVDCloseFile(dvd_file);
@@ -1387,7 +1885,7 @@ static int DVDCopyMenu(dvd_reader_t * dvd, title_set_info_t * title_set_info, in
 		strncpy(progressText, _("menu"), MAXNAME);
 	}
 
-	result = DVDCopyBlocks(dvd_file, streamout, 0, size, filename, errorstrat);
+	result = DVDCopyBlocks(dvd_file, streamout, 0, size, targetname, filename, errorstrat);
 
 	DVDCloseFile(dvd_file);
 	close(streamout);
@@ -1453,7 +1951,11 @@ static int DVDCopyIfoBup(dvd_reader_t* dvd, title_set_info_t* title_set_info, in
 
 	if (stat(targetname_ifo, &fileinfo) == 0) {
 		/* TRANSLATORS: The sentence starts with "The IFO file %s exists[...]" */
-		fprintf(stderr, _("The %s %s exists; will try to overwrite it.\n"), _("IFO file"), targetname_ifo);
+		if (fill_gaps) {
+			fprintf(stderr, _("The %s %s exists; refreshing it for --gaps.\n"), _("IFO file"), targetname_ifo);
+		} else {
+			fprintf(stderr, _("The %s %s exists; truncating before copy.\n"), _("IFO file"), targetname_ifo);
+		}
 		if (! S_ISREG(fileinfo.st_mode)) {
 			/* TRANSLATORS: The sentence starts with "The IFO file %s is not valid[...]" */
 			fprintf(stderr,_("The %s %s is not valid, it may be a directory.\n"), _("IFO file"), targetname_ifo);
@@ -1465,7 +1967,11 @@ static int DVDCopyIfoBup(dvd_reader_t* dvd, title_set_info_t* title_set_info, in
 
 	if (stat(targetname_bup, &fileinfo) == 0) {
 		/* TRANSLATORS: The sentence starts with "The BUP file %s exists[...]" */
-		fprintf(stderr, _("The %s %s exists; will try to overwrite it.\n"), _("BUP file"), targetname_bup);
+		if (fill_gaps) {
+			fprintf(stderr, _("The %s %s exists; refreshing it for --gaps.\n"), _("BUP file"), targetname_bup);
+		} else {
+			fprintf(stderr, _("The %s %s exists; truncating before copy.\n"), _("BUP file"), targetname_bup);
+		}
 		if (! S_ISREG(fileinfo.st_mode)) {
 			/* TRANSLATORS: The sentence starts with "The BUP file %s is not valid[...]" */
 			fprintf(stderr,_("The %s %s is not valid, it may be a directory.\n"), _("BUP file"), targetname_bup);
