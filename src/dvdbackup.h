@@ -37,6 +37,17 @@ typedef enum {
 	STRATEGY_SKIP_MULTIBLOCK
 } read_error_strategy_t;
 
+typedef enum {
+	GAP_STRATEGY_FORWARD,
+	GAP_STRATEGY_REVERSE,
+	GAP_STRATEGY_OUTSIDE_IN,
+	GAP_STRATEGY_RANDOM
+} gap_strategy_t;
+
+extern gap_strategy_t gap_strategy;
+extern unsigned int gap_random_seed;
+extern int gap_random_seed_set;
+
 int DVDDisplayInfo(dvd_reader_t*, char*);
 int DVDGetTitleName(const char*, char*);
 int DVDMirror(dvd_reader_t*, char*, char*, read_error_strategy_t);

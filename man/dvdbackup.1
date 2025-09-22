@@ -90,6 +90,14 @@ sample existing backup files against the DVD, report how many sectors were
 zero-filled or missing before and after the refresh, print how many sectors
 were refilled, and refill only those gaps without truncating matching content
 .TP
+.B \-\-gap-strategy=\fIMODE\fR
+control how gap refill traverses the missing blocks: choose from
+\fBforward\fR, \fBreverse\fR, \fBoutside-in\fR, or \fBrandom\fR (default is
+forward)
+.TP
+.B \-\-gap-random-seed=\fIN\fR
+set a deterministic seed for the \fBrandom\fR gap strategy (default 0)
+.TP
 .B \-\-no-overwrite
 abort if the target title directory already exists
 .SH Option notes

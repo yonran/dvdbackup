@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* C POSIX libraries */
 #include <sys/stat.h>
@@ -105,6 +106,9 @@ Print a friendly, customizable greeting.\n"), stdout); */
                           m=skip multiple blocks (default)\n\
   -p, --progress           print progress information while copying VOBs\n\
       --gaps               verify existing output and fill missing blocks\n\
+      --gap-strategy=MODE  reorder gap fill attempts: forward, reverse,\n\
+                          outside-in, or random\n\
+      --gap-random-seed=N  seed for the random gap strategy (default 0)\n\
       --no-overwrite       abort if the target title directory already exists\n\n"));
 
 	printf(_("\
@@ -203,6 +207,8 @@ int main(int argc, char* argv[]) {
 		{"progress", no_argument, NULL, 'p'},
 		{"gaps", no_argument, NULL, 'G'},
 		{"no-overwrite", no_argument, NULL, 'O'},
+		{"gap-strategy", required_argument, NULL, 0},
+		{"gap-random-seed", required_argument, NULL, 0},
 		{NULL, 0, NULL, 0}
 	};
 	const char* shortopts = "hVIMFT:t:s:e:i:o:vn:a:r:pGO";
@@ -212,8 +218,35 @@ int main(int argc, char* argv[]) {
 
 	/* TODO: do isdigit check */
 
-	while((flags = getopt_long(argc, argv, shortopts, longopts, NULL)) != -1) {
+	int option_index = 0;
+	while((flags = getopt_long(argc, argv, shortopts, longopts, &option_index)) != -1) {
 		switch(flags) {
+		case 0:
+			if (strcmp(longopts[option_index].name, "gap-strategy") == 0) {
+				if (strcasecmp(optarg, "forward") == 0) {
+					gap_strategy = GAP_STRATEGY_FORWARD;
+				} else if (strcasecmp(optarg, "reverse") == 0) {
+					gap_strategy = GAP_STRATEGY_REVERSE;
+				} else if (strcasecmp(optarg, "outside-in") == 0 || strcasecmp(optarg, "outside_in") == 0) {
+					gap_strategy = GAP_STRATEGY_OUTSIDE_IN;
+				} else if (strcasecmp(optarg, "random") == 0) {
+					gap_strategy = GAP_STRATEGY_RANDOM;
+				} else {
+					fprintf(stderr, _("Unknown gap strategy '%s'. Use forward, reverse, outside-in, or random.\n"), optarg);
+					lose = true;
+				}
+			} else if (strcmp(longopts[option_index].name, "gap-random-seed") == 0) {
+				char* endptr = NULL;
+				unsigned long seed = strtoul(optarg, &endptr, 0);
+				if (optarg[0] == '\0' || (endptr && *endptr != '\0')) {
+					fprintf(stderr, _("Invalid gap random seed '%s'.\n"), optarg);
+					lose = true;
+				} else {
+					gap_random_seed = (unsigned int)seed;
+					gap_random_seed_set = 1;
+				}
+			}
+			break;
 		case 'h':
 			print_help();
 			exit(EXIT_SUCCESS);

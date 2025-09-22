@@ -31,6 +31,9 @@ General backup information:
 	good data.
 	Use the --no-overwrite flag to abort instead of touching an existing
 	title directory.
+	Control how gaps are scanned with --gap-strategy (forward, reverse,
+	outside-in, random) and optionally set a deterministic --gap-random-seed
+	when using the random strategy.
 
 	However the -t and (-t -s/-e) switch is a bit different the titles
 	sectors will be written to the original file but not at the same offset

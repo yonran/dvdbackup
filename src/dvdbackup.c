@@ -70,6 +70,9 @@ int progress = 0;
 char progressText[MAXNAME] = "n/a";
 int fill_gaps = 0;
 int no_overwrite = 0;
+gap_strategy_t gap_strategy = GAP_STRATEGY_FORWARD;
+unsigned int gap_random_seed = 0;
+int gap_random_seed_set = 0;
 
 /* Structs to keep title set information in */
 
@@ -106,6 +109,16 @@ typedef struct {
 
 
 static void bsort_max_to_min(int sector[], int title[], int size);
+
+typedef struct {
+	size_t start_block;
+	size_t block_count;
+} gap_fill_segment_t;
+
+static int gap_process_segment(int fd, dvd_file_t* dvd_file, int dvd_offset,
+		size_t segment_start, size_t block_count, const char* filename,
+		read_error_strategy_t errorstrat, unsigned char* buffer,
+		size_t* filled_blocks_out);
 
 
 static int buffer_is_blank(const unsigned char* buffer, size_t length) {
@@ -294,6 +307,87 @@ static int gap_plan_contains(const gap_plan_t* plan, size_t block) {
 		}
 		if (block < range->start_block + range->block_count) {
 			return 1;
+		}
+	}
+
+	return 0;
+}
+
+
+static int gap_process_segment(int fd, dvd_file_t* dvd_file, int dvd_offset,
+		size_t segment_start, size_t block_count, const char* filename,
+		read_error_strategy_t errorstrat, unsigned char* buffer,
+		size_t* filled_blocks_out) {
+	size_t cursor = 0;
+
+	while (cursor < block_count) {
+		size_t chunk = block_count - cursor;
+		int blocks_read;
+		size_t usable_blocks = 0;
+		size_t skip_blocks = 0;
+		size_t read_block;
+		ssize_t written;
+
+		if (chunk > BUFFER_SIZE) {
+			chunk = BUFFER_SIZE;
+		}
+
+		read_block = segment_start + cursor;
+		blocks_read = DVDReadBlocks(dvd_file, dvd_offset + (int)read_block, (int)chunk, buffer);
+		if (blocks_read == (int)chunk) {
+			usable_blocks = chunk;
+		} else if (blocks_read > 0) {
+			usable_blocks = (size_t)blocks_read;
+			fprintf(stderr, _("Gap fill warning for %s: read %d of %zu blocks at %zu\n"),
+				filename, blocks_read, chunk, read_block);
+		} else {
+			fprintf(stderr, _("Gap fill error for %s: read failure at block %zu\n"),
+				filename, read_block);
+		}
+
+		if (usable_blocks > 0) {
+			written = pwrite(fd, buffer, usable_blocks * DVD_VIDEO_LB_LEN,
+					(off_t)read_block * DVD_VIDEO_LB_LEN);
+			if (written != (ssize_t)(usable_blocks * DVD_VIDEO_LB_LEN)) {
+				fprintf(stderr, _("Error writing %s during gap fill\n"), filename);
+				perror(PACKAGE);
+				return 1;
+			}
+
+			if (filled_blocks_out) {
+				*filled_blocks_out += usable_blocks;
+			}
+		}
+
+		if (usable_blocks < chunk) {
+			size_t remaining = block_count - (cursor + usable_blocks);
+
+			if (remaining == 0) {
+				cursor = block_count;
+				continue;
+			}
+
+			if (errorstrat == STRATEGY_ABORT) {
+				return 1;
+			} else if (errorstrat == STRATEGY_SKIP_BLOCK) {
+				skip_blocks = 1;
+				fprintf(stderr, _("Gap fill: skipping single block for %s\n"), filename);
+			} else {
+				size_t unread = chunk - usable_blocks;
+				if (unread == 0) {
+					unread = 1;
+				}
+				skip_blocks = unread;
+				fprintf(stderr, _("Gap fill: skipping %zu blocks for %s\n"), skip_blocks, filename);
+			}
+
+			if (skip_blocks > remaining) {
+				skip_blocks = remaining;
+			}
+
+			cursor += usable_blocks + skip_blocks;
+		} else {
+			cursor += chunk;
 		}
 	}
 
@@ -490,8 +584,9 @@ static int gap_fill_from_plan(int fd, dvd_file_t* dvd_file, int dvd_offset,
 		const gap_plan_t* plan, const char* filename,
 		read_error_strategy_t errorstrat, size_t* filled_blocks_out) {
 	unsigned char* buffer;
-	size_t range_index;
 	size_t total_filled = 0;
+	size_t range_index;
+	int result = 0;
 
 	if (plan->count == 0) {
 		if (filled_blocks_out) {
@@ -508,82 +603,133 @@ static int gap_fill_from_plan(int fd, dvd_file_t* dvd_file, int dvd_offset,
 		return 1;
 	}
 
-	for (range_index = 0; range_index < plan->count; ++range_index) {
-		size_t start = plan->ranges[range_index].start_block;
-		size_t remaining = plan->ranges[range_index].block_count;
+	if (gap_strategy == GAP_STRATEGY_RANDOM) {
+		gap_fill_segment_t* segments = NULL;
+		size_t segment_count = 0;
+		size_t segment_capacity = 0;
 
-		while (remaining > 0) {
-			size_t chunk = remaining;
-			int blocks_read;
-			size_t usable_blocks = 0;
-			size_t skip_blocks = 0;
-			ssize_t written;
+		for (range_index = 0; range_index < plan->count; ++range_index) {
+			size_t produced = 0;
+			size_t range_start = plan->ranges[range_index].start_block;
+			size_t range_blocks = plan->ranges[range_index].block_count;
 
-			if (chunk > BUFFER_SIZE) {
-				chunk = BUFFER_SIZE;
-			}
-
-			blocks_read = DVDReadBlocks(dvd_file, dvd_offset + (int)start, (int)chunk, buffer);
-			if (blocks_read == (int)chunk) {
-				usable_blocks = chunk;
-			} else if (blocks_read > 0) {
-				usable_blocks = (size_t)blocks_read;
-				fprintf(stderr, _("Gap fill warning for %s: read %d of %zu blocks at %zu\n"),
-					filename, blocks_read, chunk, start);
-			} else {
-				fprintf(stderr, _("Gap fill error for %s: read failure at block %zu\n"), filename, start);
-			}
-
-			if (usable_blocks > 0) {
-				written = pwrite(fd, buffer, usable_blocks * DVD_VIDEO_LB_LEN,
-						(off_t)start * DVD_VIDEO_LB_LEN);
-				if (written != (ssize_t)(usable_blocks * DVD_VIDEO_LB_LEN)) {
-					fprintf(stderr, _("Error writing %s during gap fill\n"), filename);
-					perror(PACKAGE);
-					free(buffer);
-					if (filled_blocks_out) {
-						*filled_blocks_out = total_filled;
+			while (produced < range_blocks) {
+				size_t chunk = range_blocks - produced;
+				if (chunk > BUFFER_SIZE) {
+					chunk = BUFFER_SIZE;
+				}
+				if (segment_count == segment_capacity) {
+					size_t new_capacity = segment_capacity == 0 ? 32 : segment_capacity * 2;
+					gap_fill_segment_t* new_segments = realloc(segments, new_capacity * sizeof(*new_segments));
+					if (new_segments == NULL) {
+						free(segments);
+						free(buffer);
+						if (filled_blocks_out) {
+							*filled_blocks_out = total_filled;
+						}
+						return 1;
 					}
-					return 1;
+					segments = new_segments;
+					segment_capacity = new_capacity;
 				}
-
-				total_filled += usable_blocks;
-				start += usable_blocks;
-				remaining -= usable_blocks;
+				segments[segment_count].start_block = range_start + produced;
+				segments[segment_count].block_count = chunk;
+				segment_count++;
+				produced += chunk;
 			}
+		}
 
-			if (usable_blocks == chunk) {
-				continue;
+		srand(gap_random_seed_set ? gap_random_seed : 0);
+		for (size_t i = segment_count; i > 1; --i) {
+			size_t j = (size_t)(rand() % (int)i);
+			gap_fill_segment_t temp = segments[i - 1];
+			segments[i - 1] = segments[j];
+			segments[j] = temp;
+		}
+
+		for (size_t i = 0; i < segment_count; ++i) {
+			if (gap_process_segment(fd, dvd_file, dvd_offset,
+					segments[i].start_block, segments[i].block_count,
+					filename, errorstrat, buffer, &total_filled) != 0) {
+				result = 1;
+				break;
 			}
+		}
 
-			if (remaining == 0) {
-				continue;
-			}
+		free(segments);
+	} else {
+		for (range_index = 0; range_index < plan->count && result == 0; ++range_index) {
+			size_t range_start = plan->ranges[range_index].start_block;
+			size_t range_blocks = plan->ranges[range_index].block_count;
 
-			if (errorstrat == STRATEGY_ABORT) {
-				free(buffer);
-				if (filled_blocks_out) {
-					*filled_blocks_out = total_filled;
+			switch (gap_strategy) {
+			case GAP_STRATEGY_FORWARD:
+				if (gap_process_segment(fd, dvd_file, dvd_offset,
+							range_start, range_blocks, filename,
+							errorstrat, buffer, &total_filled) != 0) {
+					result = 1;
 				}
-				return 1;
-			} else if (errorstrat == STRATEGY_SKIP_BLOCK) {
-				skip_blocks = 1;
-				fprintf(stderr, _("Gap fill: skipping single block for %s\n"), filename);
-			} else {
-				size_t unread = chunk - usable_blocks;
-				if (unread == 0) {
-					unread = 1;
+				break;
+
+			case GAP_STRATEGY_REVERSE: {
+				size_t processed = 0;
+				while (processed < range_blocks && result == 0) {
+					size_t chunk = range_blocks - processed;
+					if (chunk > BUFFER_SIZE) {
+						chunk = BUFFER_SIZE;
+					}
+					size_t segment_start = range_start + range_blocks - processed - chunk;
+					if (gap_process_segment(fd, dvd_file, dvd_offset,
+								segment_start, chunk, filename,
+								errorstrat, buffer, &total_filled) != 0) {
+						result = 1;
+						break;
+					}
+					processed += chunk;
 				}
-				skip_blocks = unread;
-				fprintf(stderr, _("Gap fill: skipping %zu blocks for %s\n"), skip_blocks, filename);
+				break;
 			}
 
-			if (skip_blocks > remaining) {
-				skip_blocks = remaining;
+			case GAP_STRATEGY_OUTSIDE_IN: {
+				size_t front = 0;
+				size_t back = range_blocks;
+				int use_front = 1;
+				while (front < back && result == 0) {
+					size_t remaining = back - front;
+					size_t chunk = remaining;
+					if (chunk > BUFFER_SIZE) {
+						chunk = BUFFER_SIZE;
+					}
+
+					if (use_front) {
+						size_t segment_start = range_start + front;
+						if (gap_process_segment(fd, dvd_file, dvd_offset,
+									segment_start, chunk, filename,
+									errorstrat, buffer, &total_filled) != 0) {
+							result = 1;
+							break;
+						}
+						front += chunk;
+					} else {
+						size_t segment_start = range_start + (back - chunk);
+						if (gap_process_segment(fd, dvd_file, dvd_offset,
+									segment_start, chunk, filename,
+									errorstrat, buffer, &total_filled) != 0) {
+							result = 1;
+							break;
+						}
+						back -= chunk;
+					}
+
+					use_front = !use_front;
+				}
+				break;
 			}
 
-			start += skip_blocks;
-			remaining -= skip_blocks;
+			case GAP_STRATEGY_RANDOM:
+				/* handled above */
+				break;
+			}
 		}
 	}
 
@@ -591,7 +737,7 @@ static int gap_fill_from_plan(int fd, dvd_file_t* dvd_file, int dvd_offset,
 	if (filled_blocks_out) {
 		*filled_blocks_out = total_filled;
 	}
-	return 0;
+	return result;
 }
 
 
