@@ -73,6 +73,7 @@ int no_overwrite = 0;
 gap_strategy_t gap_strategy = GAP_STRATEGY_FORWARD;
 unsigned int gap_random_seed = 0;
 int gap_random_seed_set = 0;
+int compare_only = 0;
 
 /* Structs to keep title set information in */
 
@@ -203,6 +204,27 @@ static ssize_t read_existing_range(int fd, off_t offset, unsigned char* buffer, 
 
 	if (total < length) {
 		memset(buffer + total, 0x00, length - total);
+	}
+
+	return (ssize_t)total;
+}
+
+
+static ssize_t read_fully(int fd, unsigned char* buffer, size_t length) {
+	size_t total = 0;
+
+	while (total < length) {
+		ssize_t got = read(fd, buffer + total, length - total);
+		if (got < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return -1;
+		}
+		if (got == 0) {
+			return (ssize_t)total;
+		}
+		total += (size_t)got;
 	}
 
 	return (ssize_t)total;
@@ -761,6 +783,108 @@ static void gap_print_report(const char* path, size_t expected_blocks,
 		path, filled_blocks,
 		blank_before, blank_pct_before, truncated_before, trunc_pct_before,
 		blank_after, blank_pct_after, truncated_after, trunc_pct_after);
+}
+
+
+static int DVDCmpBlocks(dvd_file_t* dvd_file, int fd, int offset, int size,
+		const char* path, const char* label, read_error_strategy_t errorstrat) {
+	unsigned char dvd_buffer[BUFFER_SIZE * DVD_VIDEO_LB_LEN];
+	unsigned char file_buffer[BUFFER_SIZE * DVD_VIDEO_LB_LEN];
+	int remaining = size;
+	int total = size;
+	int to_read = BUFFER_SIZE;
+	int current_offset = offset;
+	size_t compared_blocks = 0;
+
+	(void)errorstrat;
+
+	if (lseek(fd, (off_t)offset * DVD_VIDEO_LB_LEN, SEEK_SET) == (off_t)-1) {
+		perror(PACKAGE);
+		return 1;
+	}
+
+	while (remaining > 0) {
+		if (to_read > remaining) {
+			to_read = remaining;
+		}
+
+		int act_read = DVDReadBlocks(dvd_file, current_offset, to_read, dvd_buffer);
+		if (act_read != to_read) {
+			if (progress) {
+				fprintf(stdout, "\n");
+			}
+			if (act_read >= 0) {
+				fprintf(stderr, _("Error reading %s at block %d\n"), label, current_offset + act_read);
+			} else {
+				fprintf(stderr, _("Error reading %s at block %d, read error returned\n"), label, current_offset);
+			}
+			return 1;
+		}
+
+		size_t chunk_bytes = (size_t)act_read * DVD_VIDEO_LB_LEN;
+		size_t total_read = 0;
+		while (total_read < chunk_bytes) {
+			ssize_t got = read(fd, file_buffer + total_read, chunk_bytes - total_read);
+			if (got < 0) {
+				if (errno == EINTR) {
+					continue;
+				}
+				perror(PACKAGE);
+				return 1;
+			}
+			if (got == 0) {
+				fprintf(stderr, _("File %s ended prematurely while comparing\n"), path);
+				return 1;
+			}
+			total_read += (size_t)got;
+		}
+
+		if (memcmp(dvd_buffer, file_buffer, chunk_bytes) != 0) {
+			size_t block_index;
+			for (block_index = 0; block_index < (size_t)act_read; ++block_index) {
+				if (memcmp(dvd_buffer + block_index * DVD_VIDEO_LB_LEN,
+					file_buffer + block_index * DVD_VIDEO_LB_LEN,
+					DVD_VIDEO_LB_LEN) != 0) {
+					fprintf(stderr, _("Data mismatch for %s at sector %lld\n"),
+						path, (long long)(current_offset + (int)block_index));
+					break;
+				}
+			}
+			return 1;
+		}
+
+		current_offset += act_read;
+		remaining -= act_read;
+		compared_blocks += (size_t)act_read;
+
+		if (progress) {
+			int done = (int)compared_blocks;
+			if (remaining < BUFFER_SIZE || (done % BUFFER_SIZE) == 0) {
+				float doneMiB = (float)done / 512.0f;
+				float totalMiB = (float)total / 512.0f;
+				fprintf(stdout, "\r");
+				fprintf(stdout, _("Comparing %s: %.0f%% done (%.0f/%.0f MiB)"),
+						progressText, doneMiB / totalMiB * 100.0f, doneMiB, totalMiB);
+				fflush(stdout);
+			}
+		}
+	}
+
+	unsigned char extra;
+	ssize_t extra_read = read(fd, &extra, 1);
+	if (extra_read < 0) {
+		perror(PACKAGE);
+		return 1;
+	} else if (extra_read > 0) {
+		fprintf(stderr, _("File %s contains extra data beyond expected size\n"), path);
+		return 1;
+	}
+
+	if (progress) {
+		fprintf(stdout, "\n");
+	}
+
+	return 0;
 }
 
 
@@ -1940,6 +2064,96 @@ static int DVDCopyTitleVobX(dvd_reader_t * dvd, title_set_info_t * title_set_inf
 }
 
 
+static int DVDCmpTitleVobX(dvd_reader_t * dvd, title_set_info_t * title_set_info, int title_set, int vob, char * targetdir,char * title_name, read_error_strategy_t errorstrat) {
+	char filename[13] = "VIDEO_TS.VOB";
+	char *targetname;
+	size_t targetname_length;
+	struct stat fileinfo;
+	dvd_file_t* dvd_file = NULL;
+	int fd = -1;
+	int size;
+	int offset = 0;
+	int tsize;
+
+	(void)errorstrat;
+
+	if(title_set > 0) {
+		sprintf(filename, "VTS_%02i_%1i.VOB", title_set, vob);
+	}
+
+	if (title_set_info->number_of_title_sets + 1 < title_set) {
+		return 1;
+	}
+
+	if (title_set_info->title_set[title_set].number_of_vob_files < vob ) {
+		return 1;
+	}
+
+	if (title_set_info->title_set[title_set].size_vob[0] == 0 ) {
+		return 1;
+	} else if (title_set_info->title_set[title_set].size_vob[vob - 1] == 0 ) {
+		return 1;
+	} else {
+		size = title_set_info->title_set[title_set].size_vob[vob - 1]/DVD_VIDEO_LB_LEN;
+		if (title_set_info->title_set[title_set].size_vob[vob - 1]%DVD_VIDEO_LB_LEN != 0) {
+			return 1;
+		}
+	}
+
+	for (int i = 0; i < vob - 1; i++) {
+		tsize = title_set_info->title_set[title_set].size_vob[i];
+		if (tsize % DVD_VIDEO_LB_LEN != 0) {
+			return 1;
+		}
+		offset += tsize / DVD_VIDEO_LB_LEN;
+	}
+
+	if ((dvd_file = DVDOpenFile(dvd, title_set, DVD_READ_TITLE_VOBS)) == 0) {
+		return 1;
+	}
+
+	targetname_length = strlen(targetdir) + strlen(title_name) + strlen(filename) + 12;
+	targetname = malloc(targetname_length);
+	if (targetname == NULL) {
+		DVDCloseFile(dvd_file);
+		return 1;
+	}
+	snprintf(targetname, targetname_length, "%s/%s/VIDEO_TS/%s", targetdir, title_name, filename);
+
+	if (stat(targetname, &fileinfo) != 0 || !S_ISREG(fileinfo.st_mode)) {
+		free(targetname);
+		DVDCloseFile(dvd_file);
+		return 1;
+	}
+
+	off_t expected_bytes = (off_t)size * DVD_VIDEO_LB_LEN;
+	if (fileinfo.st_size != expected_bytes) {
+		free(targetname);
+		DVDCloseFile(dvd_file);
+		return 1;
+	}
+
+	fd = open(targetname, O_RDONLY);
+	if (fd == -1) {
+		perror(PACKAGE);
+		free(targetname);
+		DVDCloseFile(dvd_file);
+		return 1;
+	}
+
+	if (progress) {
+		snprintf(progressText, MAXNAME, _("Title, part %i"), vob);
+	}
+
+	int cmp = DVDCmpBlocks(dvd_file, fd, offset, size, targetname, filename, errorstrat);
+
+	close(fd);
+	free(targetname);
+	DVDCloseFile(dvd_file);
+	return cmp;
+}
+
+
 static int DVDCopyMenu(dvd_reader_t * dvd, title_set_info_t * title_set_info, int title_set, char * targetdir,char * title_name, read_error_strategy_t errorstrat) {
 
 	/* Temp filename,dirname */
@@ -2038,6 +2252,87 @@ static int DVDCopyMenu(dvd_reader_t * dvd, title_set_info_t * title_set_info, in
 	free(targetname);
 	return result;
 
+}
+
+
+static int DVDCmpMenu(dvd_reader_t * dvd, title_set_info_t * title_set_info, int title_set, char * targetdir,char * title_name, read_error_strategy_t errorstrat) {
+	char filename[13] = "VIDEO_TS.VOB";
+	char *targetname;
+	size_t targetname_length;
+	struct stat fileinfo;
+	dvd_file_t* dvd_file = NULL;
+	int fd = -1;
+	int size;
+
+	(void)errorstrat;
+
+	if(title_set > 0) {
+		sprintf(filename, "VTS_%02i_0.VOB", title_set);
+	}
+
+	if (title_set_info->number_of_title_sets + 1 < title_set) {
+		return 1;
+	}
+
+	if (title_set_info->title_set[title_set].size_menu == 0) {
+		return 0;
+	}
+
+	if (title_set_info->title_set[title_set].size_menu % DVD_VIDEO_LB_LEN != 0) {
+		fprintf(stderr, _("Warning: The Menu VOB of title set %d (%s) does not have a valid DVD size.\n"), title_set, filename);
+		return 1;
+	}
+
+	if ((dvd_file = DVDOpenFile(dvd, title_set, DVD_READ_MENU_VOBS)) == 0) {
+		fprintf(stderr, _("Failed opening %s\n"), filename);
+		return 1;
+	}
+
+	size = title_set_info->title_set[title_set].size_menu / DVD_VIDEO_LB_LEN;
+	targetname_length = strlen(targetdir) + strlen(title_name) + strlen(filename) + 12;
+	targetname = malloc(targetname_length);
+	if (targetname == NULL) {
+		fprintf(stderr, _("Failed to allocate %zu bytes for a filename.\n"), targetname_length);
+		DVDCloseFile(dvd_file);
+		return 1;
+	}
+	snprintf(targetname, targetname_length, "%s/%s/VIDEO_TS/%s", targetdir, title_name, filename);
+
+	if (stat(targetname, &fileinfo) != 0 || !S_ISREG(fileinfo.st_mode)) {
+		fprintf(stderr, _("Cannot compare %s; file is missing or invalid.\n"), targetname);
+		free(targetname);
+		DVDCloseFile(dvd_file);
+		return 1;
+	}
+
+	off_t expected_bytes = (off_t)size * DVD_VIDEO_LB_LEN;
+	if (fileinfo.st_size != expected_bytes) {
+		fprintf(stderr, _("Size mismatch for %s: expected %lld bytes, found %lld bytes.\n"),
+			targetname, (long long)expected_bytes, (long long)fileinfo.st_size);
+		free(targetname);
+		DVDCloseFile(dvd_file);
+		return 1;
+	}
+
+	fd = open(targetname, O_RDONLY);
+	if (fd == -1) {
+		fprintf(stderr, _("Error opening %s\n"), targetname);
+		perror(PACKAGE);
+		free(targetname);
+		DVDCloseFile(dvd_file);
+		return 1;
+	}
+
+	if (progress) {
+		strncpy(progressText, _("menu"), MAXNAME);
+	}
+
+	int cmp = DVDCmpBlocks(dvd_file, fd, 0, size, targetname, filename, errorstrat);
+
+	close(fd);
+	free(targetname);
+	DVDCloseFile(dvd_file);
+	return cmp;
 }
 
 
@@ -2219,6 +2514,128 @@ static int DVDCopyIfoBup(dvd_reader_t* dvd, title_set_info_t* title_set_info, in
 }
 
 
+	free(targetname_ifo);
+	free(targetname_bup);
+	return 0;
+}
+
+
+static int DVDCmpIfoBup(dvd_reader_t* dvd, title_set_info_t* title_set_info, int title_set, char* targetdir, char* title_name, read_error_strategy_t errorstrat) {
+	char *targetname_ifo = NULL;
+	char *targetname_bup = NULL;
+	size_t string_length;
+	struct stat fileinfo;
+	dvd_file_t* dvd_file = NULL;
+	int fd = -1;
+	int blocks;
+	char ifo_label[16];
+
+	if (title_set_info->number_of_title_sets + 1 < title_set) {
+		return 1;
+	}
+
+	if (title_set_info->title_set[title_set].size_ifo == 0) {
+		return 0;
+	}
+
+	if (title_set_info->title_set[title_set].size_ifo % DVD_VIDEO_LB_LEN != 0) {
+		fprintf(stderr, _("The IFO of title set %d does not have a valid DVD size\n"), title_set);
+		return 1;
+	}
+
+	blocks = title_set_info->title_set[title_set].size_ifo / DVD_VIDEO_LB_LEN;
+
+	string_length = strlen(targetdir) + strlen(title_name) + 24;
+	targetname_ifo = malloc(string_length);
+	targetname_bup = malloc(string_length);
+	if (targetname_ifo == NULL || targetname_bup == NULL) {
+		fprintf(stderr, _("Failed to allocate %zu bytes for a filename.\n"), string_length);
+		free(targetname_ifo);
+		free(targetname_bup);
+		return 1;
+	}
+
+	if (title_set == 0) {
+		snprintf(targetname_ifo, string_length, "%s/%s/VIDEO_TS/VIDEO_TS.IFO", targetdir, title_name);
+		snprintf(targetname_bup, string_length, "%s/%s/VIDEO_TS/VIDEO_TS.BUP", targetdir, title_name);
+		snprintf(ifo_label, sizeof(ifo_label), "VIDEO_TS.IFO");
+	} else {
+		snprintf(targetname_ifo, string_length, "%s/%s/VIDEO_TS/VTS_%02i_0.IFO", targetdir, title_name, title_set);
+		snprintf(targetname_bup, string_length, "%s/%s/VIDEO_TS/VTS_%02i_0.BUP", targetdir, title_name, title_set);
+		snprintf(ifo_label, sizeof(ifo_label), "VTS_%02d_0.IFO", title_set);
+	}
+
+	if (stat(targetname_ifo, &fileinfo) != 0 || !S_ISREG(fileinfo.st_mode)) {
+		fprintf(stderr, _("Cannot compare %s; file is missing or invalid.\n"), targetname_ifo);
+		goto cmp_ifo_cleanup;
+	}
+
+	if (stat(targetname_bup, &fileinfo) != 0 || !S_ISREG(fileinfo.st_mode)) {
+		fprintf(stderr, _("Cannot compare %s; file is missing or invalid.\n"), targetname_bup);
+		goto cmp_ifo_cleanup;
+	}
+
+	dvd_file = DVDOpenFile(dvd, title_set, DVD_READ_INFO_FILE);
+	if (dvd_file == NULL) {
+		fprintf(stderr, _("Failed opening info file for title set %d\n"), title_set);
+		goto cmp_ifo_cleanup;
+	}
+
+	fd = open(targetname_ifo, O_RDONLY);
+	if (fd == -1) {
+		fprintf(stderr, _("Error opening %s\n"), targetname_ifo);
+		perror(PACKAGE);
+		goto cmp_ifo_cleanup;
+	}
+
+	if (DVDCmpBlocks(dvd_file, fd, 0, blocks, targetname_ifo, ifo_label, errorstrat) != 0) {
+		goto cmp_ifo_cleanup;
+	}
+
+	close(fd);
+	DVDCloseFile(dvd_file);
+	dvd_file = NULL;
+
+	dvd_file = DVDOpenFile(dvd, title_set, DVD_READ_INFO_FILE);
+	if (dvd_file == NULL) {
+		fprintf(stderr, _("Failed reopening info file for title set %d\n"), title_set);
+		goto cmp_ifo_cleanup;
+	}
+
+	fd = open(targetname_bup, O_RDONLY);
+	if (fd == -1) {
+		fprintf(stderr, _("Error opening %s\n"), targetname_bup);
+		perror(PACKAGE);
+		goto cmp_ifo_cleanup;
+	}
+
+	if (DVDCmpBlocks(dvd_file, fd, 0, blocks, targetname_bup, ifo_label, errorstrat) != 0) {
+		goto cmp_ifo_cleanup;
+	}
+
+	close(fd);
+	DVDCloseFile(dvd_file);
+	free(targetname_ifo);
+	free(targetname_bup);
+	return 0;
+
+cmp_ifo_cleanup:
+	if (fd != -1) {
+		close(fd);
+	}
+	if (dvd_file) {
+		DVDCloseFile(dvd_file);
+	}
+	if (targetname_ifo) {
+		free(targetname_ifo);
+	}
+	if (targetname_bup) {
+		free(targetname_bup);
+	}
+	return 1;
+}
+
+
 static int DVDMirrorTitleX(dvd_reader_t* dvd, title_set_info_t* title_set_info,
 		int title_set, char* targetdir, char* title_name,
 		read_error_strategy_t errorstrat) {
@@ -2227,12 +2644,20 @@ static int DVDMirrorTitleX(dvd_reader_t* dvd, title_set_info_t* title_set_info,
 	int i;
 	int n;
 
-	if ( DVDCopyIfoBup(dvd, title_set_info, title_set, targetdir, title_name) != 0 ) {
-		return(1);
+	if (compare_only) {
+		if ( DVDCmpIfoBup(dvd, title_set_info, title_set, targetdir, title_name, errorstrat) != 0 ) {
+			return 1;
+		}
+	} else if ( DVDCopyIfoBup(dvd, title_set_info, title_set, targetdir, title_name) != 0 ) {
+		return 1;
 	}
 
-	if ( DVDCopyMenu(dvd, title_set_info, title_set, targetdir, title_name, errorstrat) != 0 ) {
-		return(1);
+	if (compare_only) {
+		if ( DVDCmpMenu(dvd, title_set_info, title_set, targetdir, title_name, errorstrat) != 0 ) {
+			return 1;
+		}
+	} else if ( DVDCopyMenu(dvd, title_set_info, title_set, targetdir, title_name, errorstrat) != 0 ) {
+		return 1;
 	}
 
 	n = title_set_info->title_set[title_set].number_of_vob_files;
@@ -2243,9 +2668,12 @@ static int DVDMirrorTitleX(dvd_reader_t* dvd, title_set_info_t* title_set_info,
 		if(progress) {
 			snprintf(progressText, MAXNAME, _("Title, part %i/%i"), i+1, n);
 		}
-
-		if ( DVDCopyTitleVobX(dvd, title_set_info, title_set, i + 1, targetdir, title_name, errorstrat) != 0 ) {
-		return(1);
+		if (compare_only) {
+			if ( DVDCmpTitleVobX(dvd, title_set_info, title_set, i + 1, targetdir, title_name, errorstrat) != 0 ) {
+				return 1;
+			}
+		} else if ( DVDCopyTitleVobX(dvd, title_set_info, title_set, i + 1, targetdir, title_name, errorstrat) != 0 ) {
+			return 1;
 		}
 	}
 

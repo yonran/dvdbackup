@@ -47,6 +47,7 @@ typedef enum {
 extern gap_strategy_t gap_strategy;
 extern unsigned int gap_random_seed;
 extern int gap_random_seed_set;
+extern int compare_only;
 
 int DVDDisplayInfo(dvd_reader_t*, char*);
 int DVDGetTitleName(const char*, char*);

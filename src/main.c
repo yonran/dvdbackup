@@ -407,6 +407,15 @@ int main(int argc, char* argv[]) {
 		print_help();
 		exit(1);
 	}
+
+	if (compare_only) {
+		if (!do_mirror || do_info || do_titles || do_chapter || do_feature || do_title_set) {
+			fprintf(stderr, _("--cmp currently requires -M and no other copy modes.\n"));
+			print_help();
+			exit(1);
+		}
+		fill_gaps = 0;
+	}
 #ifdef DEBUG
 	fprintf(stderr,"After args\n");
 #endif
@@ -462,6 +471,11 @@ int main(int argc, char* argv[]) {
 			fprintf(stderr,_("The target directory is not valid; it may be an ordinary file.\n"));
 		}
 	} else {
+		if (compare_only) {
+			fprintf(stderr, _("The target directory %s is missing.\n"), targetname);
+			DVDClose(_dvd);
+			exit(-1);
+		}
 		if (mkdir(targetname, 0777) != 0) {
 			fprintf(stderr,_("Failed creating target directory %s\n"), targetname);
 			perror("");
@@ -483,6 +497,12 @@ int main(int argc, char* argv[]) {
 			exit(-1);
 		}
 	} else {
+		if (compare_only) {
+			fprintf(stderr, _("The title directory %s is missing.\n"), targetname);
+			free(targetname);
+			DVDClose(_dvd);
+			exit(-1);
+		}
 		if (mkdir(targetname, 0777) != 0) {
 			fprintf(stderr,_("Failed creating title directory\n"));
 			perror("");
@@ -503,6 +523,12 @@ int main(int argc, char* argv[]) {
 			exit(-1);
 		}
 	} else {
+		if (compare_only) {
+			fprintf(stderr, _("The VIDEO_TS directory %s is missing.\n"), targetname);
+			free(targetname);
+			DVDClose(_dvd);
+			exit(-1);
+		}
 		if (mkdir(targetname, 0777) != 0) {
 			fprintf(stderr,_("Failed creating VIDEO_TS directory\n"));
 			perror("");
