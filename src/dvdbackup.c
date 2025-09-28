@@ -74,6 +74,7 @@ gap_strategy_t gap_strategy = GAP_STRATEGY_FORWARD;
 unsigned int gap_random_seed = 0;
 int gap_random_seed_set = 0;
 int compare_only = 0;
+int gap_map = 0;
 
 /* Structs to keep title set information in */
 
@@ -267,6 +268,20 @@ typedef struct {
 	size_t capacity;
 } gap_plan_t;
 
+typedef struct {
+	size_t start_block;
+	size_t block_count;
+} gap_map_entry_t;
+
+typedef struct {
+	gap_map_entry_t* entries;
+	size_t count;
+	size_t capacity;
+} gap_map_info_t;
+
+static gap_map_info_t gap_map_info = {0};
+static size_t gap_map_total_blocks = 0;
+
 
 static void gap_plan_free(gap_plan_t* plan) {
 	free(plan->ranges);
@@ -333,6 +348,145 @@ static int gap_plan_contains(const gap_plan_t* plan, size_t block) {
 	}
 
 	return 0;
+}
+
+
+void gap_map_reset(void) {
+	free(gap_map_info.entries);
+	gap_map_info.entries = NULL;
+	gap_map_info.count = 0;
+	gap_map_info.capacity = 0;
+	gap_map_total_blocks = 0;
+}
+
+
+static int gap_map_add_entry(size_t start_block, size_t block_count) {
+	gap_map_entry_t* entry;
+
+	if (block_count == 0) {
+		return 0;
+	}
+
+	if (gap_map_info.count == gap_map_info.capacity) {
+		size_t new_capacity = gap_map_info.capacity == 0 ? 32 : gap_map_info.capacity * 2;
+		gap_map_entry_t* new_entries = realloc(gap_map_info.entries, new_capacity * sizeof(*new_entries));
+		if (new_entries == NULL) {
+			return -1;
+		}
+		gap_map_info.entries = new_entries;
+		gap_map_info.capacity = new_capacity;
+	}
+
+	entry = &gap_map_info.entries[gap_map_info.count++];
+	entry->start_block = start_block;
+	entry->block_count = block_count;
+	return 0;
+}
+
+
+static int gap_map_collect_from_plan(size_t base_block, size_t expected_blocks,
+		const gap_plan_t* plan, size_t existing_blocks) {
+	size_t i;
+
+	for (i = 0; i < plan->count; ++i) {
+		if (gap_map_add_entry(base_block + plan->ranges[i].start_block,
+				plan->ranges[i].block_count) != 0) {
+			return -1;
+		}
+	}
+
+	if (existing_blocks < expected_blocks) {
+		size_t missing = expected_blocks - existing_blocks;
+		if (gap_map_add_entry(base_block + existing_blocks, missing) != 0) {
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+
+static int gap_map_collect_missing(size_t base_block, size_t expected_blocks) {
+	return gap_map_add_entry(base_block, expected_blocks);
+}
+
+
+void gap_map_render(void) {
+	const int rows = 20;
+	const int cols = 60;
+	char map[20][60];
+	size_t i;
+	const size_t inner_turn = 192;
+	const size_t outer_turn = 432;
+
+	if (gap_map_total_blocks == 0) {
+		printf(_("Gap map: no sectors examined.\n"));
+		return;
+	}
+
+	for (int r = 0; r < rows; ++r) {
+		for (int c = 0; c < cols; ++c) {
+			map[r][c] = '.';
+		}
+	}
+
+	for (i = 0; i < gap_map_info.count; ++i) {
+		size_t start = gap_map_info.entries[i].start_block;
+		size_t end = start + gap_map_info.entries[i].block_count;
+		size_t span = gap_map_info.entries[i].block_count;
+		size_t step = span / ((size_t)cols / 2 + 1);
+		if (step == 0) {
+			step = 1;
+		}
+		for (size_t block = start; block < end; block += step) {
+			size_t relative = block;
+			if (relative >= gap_map_total_blocks) {
+				relative = gap_map_total_blocks - 1;
+			}
+			size_t row_index = (relative * (size_t)rows) / gap_map_total_blocks;
+			if (row_index >= (size_t)rows) {
+				row_index = (size_t)rows - 1;
+			}
+			size_t turn_range;
+			if (rows > 1) {
+				size_t numerator = (outer_turn - inner_turn) * row_index;
+				size_t denom = (size_t)rows - 1;
+				size_t delta = denom ? numerator / denom : 0;
+				turn_range = inner_turn + delta;
+			} else {
+				turn_range = inner_turn;
+			}
+			if (turn_range == 0) {
+				turn_range = 1;
+			}
+			size_t pos_in_turn = relative % turn_range;
+			int col = (int)((pos_in_turn * (size_t)cols) / turn_range);
+			if (col >= cols) {
+				col = cols - 1;
+			}
+			int row = (int)row_index;
+			map[row][col] = '#';
+		}
+	}
+
+	printf(_("Gap map (rows = inner to outer radius, columns = approximate angle):\n"));
+	for (int r = 0; r < rows; ++r) {
+		printf("|");
+		for (int c = 0; c < cols; ++c) {
+			putchar(map[r][c]);
+		}
+		printf("|\n");
+	}
+	printf(_("# marks sectors that appear blank or missing. Angle is estimated using an average turn length.\n"));
+}
+
+
+void gap_map_free(void) {
+	free(gap_map_info.entries);
+	gap_map_info.entries = NULL;
+	gap_map_info.count = 0;
+	gap_map_info.capacity = 0;
+	gap_map_total_blocks = 0;
 }
 
 
@@ -2121,6 +2275,11 @@ static int DVDCmpTitleVobX(dvd_reader_t * dvd, title_set_info_t * title_set_info
 	snprintf(targetname, targetname_length, "%s/%s/VIDEO_TS/%s", targetdir, title_name, filename);
 
 	if (stat(targetname, &fileinfo) != 0 || !S_ISREG(fileinfo.st_mode)) {
+		if (gap_map) {
+			size_t base = gap_map_total_blocks;
+			gap_map_collect_missing(base, (size_t)size);
+			gap_map_total_blocks += size;
+		}
 		free(targetname);
 		DVDCloseFile(dvd_file);
 		return 1;
@@ -2128,6 +2287,11 @@ static int DVDCmpTitleVobX(dvd_reader_t * dvd, title_set_info_t * title_set_info
 
 	off_t expected_bytes = (off_t)size * DVD_VIDEO_LB_LEN;
 	if (fileinfo.st_size != expected_bytes) {
+		if (gap_map) {
+			size_t base = gap_map_total_blocks;
+			gap_map_collect_missing(base, (size_t)size);
+			gap_map_total_blocks += size;
+		}
 		free(targetname);
 		DVDCloseFile(dvd_file);
 		return 1;
@@ -2143,6 +2307,28 @@ static int DVDCmpTitleVobX(dvd_reader_t * dvd, title_set_info_t * title_set_info
 
 	if (progress) {
 		snprintf(progressText, MAXNAME, _("Title, part %i"), vob);
+	}
+
+	if (gap_map) {
+		size_t base = gap_map_total_blocks;
+		gap_plan_t plan = {0};
+		size_t blank_blocks = 0;
+		size_t full_blocks = 0;
+		off_t existing_bytes = 0;
+		if (scan_existing_file_for_gaps(fd, (size_t)size, &plan, &blank_blocks, &full_blocks, &existing_bytes) == 0) {
+			gap_map_collect_from_plan(base, (size_t)size, &plan, full_blocks);
+		} else {
+			gap_map_collect_missing(base, (size_t)size);
+		}
+		gap_plan_free(&plan);
+		gap_map_total_blocks += size;
+		if (lseek(fd, (off_t)offset * DVD_VIDEO_LB_LEN, SEEK_SET) == (off_t)-1) {
+			perror(PACKAGE);
+			close(fd);
+			free(targetname);
+			DVDCloseFile(dvd_file);
+			return 1;
+		}
 	}
 
 	int cmp = DVDCmpBlocks(dvd_file, fd, offset, size, targetname, filename, errorstrat);
@@ -2300,6 +2486,11 @@ static int DVDCmpMenu(dvd_reader_t * dvd, title_set_info_t * title_set_info, int
 
 	if (stat(targetname, &fileinfo) != 0 || !S_ISREG(fileinfo.st_mode)) {
 		fprintf(stderr, _("Cannot compare %s; file is missing or invalid.\n"), targetname);
+		if (gap_map) {
+			size_t base = gap_map_total_blocks;
+			gap_map_collect_missing(base, (size_t)size);
+			gap_map_total_blocks += size;
+		}
 		free(targetname);
 		DVDCloseFile(dvd_file);
 		return 1;
@@ -2309,6 +2500,11 @@ static int DVDCmpMenu(dvd_reader_t * dvd, title_set_info_t * title_set_info, int
 	if (fileinfo.st_size != expected_bytes) {
 		fprintf(stderr, _("Size mismatch for %s: expected %lld bytes, found %lld bytes.\n"),
 			targetname, (long long)expected_bytes, (long long)fileinfo.st_size);
+		if (gap_map) {
+			size_t base = gap_map_total_blocks;
+			gap_map_collect_missing(base, (size_t)size);
+			gap_map_total_blocks += size;
+		}
 		free(targetname);
 		DVDCloseFile(dvd_file);
 		return 1;
@@ -2325,6 +2521,28 @@ static int DVDCmpMenu(dvd_reader_t * dvd, title_set_info_t * title_set_info, int
 
 	if (progress) {
 		strncpy(progressText, _("menu"), MAXNAME);
+	}
+
+	if (gap_map) {
+		size_t base = gap_map_total_blocks;
+		gap_plan_t plan = {0};
+		size_t blank_blocks = 0;
+		size_t full_blocks = 0;
+		off_t existing_bytes = 0;
+		if (scan_existing_file_for_gaps(fd, (size_t)size, &plan, &blank_blocks, &full_blocks, &existing_bytes) == 0) {
+			gap_map_collect_from_plan(base, (size_t)size, &plan, full_blocks);
+		} else {
+			gap_map_collect_missing(base, (size_t)size);
+		}
+		gap_plan_free(&plan);
+		gap_map_total_blocks += size;
+		if (lseek(fd, 0, SEEK_SET) == (off_t)-1) {
+			perror(PACKAGE);
+			close(fd);
+			free(targetname);
+			DVDCloseFile(dvd_file);
+			return 1;
+		}
 	}
 
 	int cmp = DVDCmpBlocks(dvd_file, fd, 0, size, targetname, filename, errorstrat);
@@ -2508,17 +2726,15 @@ static int DVDCopyIfoBup(dvd_reader_t* dvd, title_set_info_t* title_set_info, in
 		return 1;
 	}
 
+	ifoClose(ifo_file);
+	free(buffer);
+	close(streamout_ifo);
+	close(streamout_bup);
+
 	free(targetname_ifo);
 	free(targetname_bup);
 	return 0;
 }
-
-
-	free(targetname_ifo);
-	free(targetname_bup);
-	return 0;
-}
-
 
 static int DVDCmpIfoBup(dvd_reader_t* dvd, title_set_info_t* title_set_info, int title_set, char* targetdir, char* title_name, read_error_strategy_t errorstrat) {
 	char *targetname_ifo = NULL;
@@ -2588,6 +2804,25 @@ static int DVDCmpIfoBup(dvd_reader_t* dvd, title_set_info_t* title_set_info, int
 		goto cmp_ifo_cleanup;
 	}
 
+	if (gap_map) {
+		size_t base = gap_map_total_blocks;
+		gap_plan_t plan = {0};
+		size_t blank_blocks = 0;
+		size_t full_blocks = 0;
+		off_t existing_bytes = 0;
+		if (scan_existing_file_for_gaps(fd, (size_t)blocks, &plan, &blank_blocks, &full_blocks, &existing_bytes) == 0) {
+			gap_map_collect_from_plan(base, (size_t)blocks, &plan, full_blocks);
+		} else {
+			gap_map_collect_missing(base, (size_t)blocks);
+		}
+		gap_plan_free(&plan);
+		gap_map_total_blocks += blocks;
+		if (lseek(fd, 0, SEEK_SET) == (off_t)-1) {
+			perror(PACKAGE);
+			goto cmp_ifo_cleanup;
+		}
+	}
+
 	if (DVDCmpBlocks(dvd_file, fd, 0, blocks, targetname_ifo, ifo_label, errorstrat) != 0) {
 		goto cmp_ifo_cleanup;
 	}
@@ -2607,6 +2842,25 @@ static int DVDCmpIfoBup(dvd_reader_t* dvd, title_set_info_t* title_set_info, int
 		fprintf(stderr, _("Error opening %s\n"), targetname_bup);
 		perror(PACKAGE);
 		goto cmp_ifo_cleanup;
+	}
+
+	if (gap_map) {
+		size_t base = gap_map_total_blocks;
+		gap_plan_t plan = {0};
+		size_t blank_blocks = 0;
+		size_t full_blocks = 0;
+		off_t existing_bytes = 0;
+		if (scan_existing_file_for_gaps(fd, (size_t)blocks, &plan, &blank_blocks, &full_blocks, &existing_bytes) == 0) {
+			gap_map_collect_from_plan(base, (size_t)blocks, &plan, full_blocks);
+		} else {
+			gap_map_collect_missing(base, (size_t)blocks);
+		}
+		gap_plan_free(&plan);
+		gap_map_total_blocks += blocks;
+		if (lseek(fd, 0, SEEK_SET) == (off_t)-1) {
+			perror(PACKAGE);
+			goto cmp_ifo_cleanup;
+		}
 	}
 
 	if (DVDCmpBlocks(dvd_file, fd, 0, blocks, targetname_bup, ifo_label, errorstrat) != 0) {

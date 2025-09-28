@@ -205,13 +205,15 @@ int main(int argc, char* argv[]) {
 		{"aspect", required_argument, NULL, 'a'},
 		{"error", required_argument, NULL, 'r'},
 		{"progress", no_argument, NULL, 'p'},
+		{"cmp", no_argument, NULL, 'C'},
 		{"gaps", no_argument, NULL, 'G'},
 		{"no-overwrite", no_argument, NULL, 'O'},
 		{"gap-strategy", required_argument, NULL, 0},
 		{"gap-random-seed", required_argument, NULL, 0},
+		{"gap-map", no_argument, NULL, 0},
 		{NULL, 0, NULL, 0}
 	};
-	const char* shortopts = "hVIMFT:t:s:e:i:o:vn:a:r:pGO";
+	const char* shortopts = "hVIMFT:t:s:e:i:o:vn:a:r:pCGO";
 
 	init_i18n();
 	program_name = argv[0];
@@ -245,6 +247,13 @@ int main(int argc, char* argv[]) {
 					gap_random_seed = (unsigned int)seed;
 					gap_random_seed_set = 1;
 				}
+			} else if (strcmp(longopts[option_index].name, "gap-map") == 0) {
+				if (fill_gaps) {
+					fprintf(stderr, _("--gap-map cannot be combined with --gaps.\n"));
+					lose = true;
+				}
+				gap_map = 1;
+				compare_only = 1;
 			}
 			break;
 		case 'h':
@@ -299,8 +308,16 @@ int main(int argc, char* argv[]) {
 		case 'p':
 			progress = 1;
 			break;
+		case 'C':
+			compare_only = 1;
+			break;
 		case 'G':
-			fill_gaps = 1;
+			if (gap_map) {
+				fprintf(stderr, _("--gaps cannot be combined with --gap-map.\n"));
+				lose = true;
+			} else {
+				fill_gaps = 1;
+			}
 			break;
 		case 'O':
 			no_overwrite = 1;
@@ -410,11 +427,14 @@ int main(int argc, char* argv[]) {
 
 	if (compare_only) {
 		if (!do_mirror || do_info || do_titles || do_chapter || do_feature || do_title_set) {
-			fprintf(stderr, _("--cmp currently requires -M and no other copy modes.\n"));
+			fprintf(stderr, _("Compare-only modes (--cmp/--gap-map) currently require -M and no other copy modes.\n"));
 			print_help();
 			exit(1);
 		}
 		fill_gaps = 0;
+	}
+	if (gap_map) {
+		gap_map_reset();
 	}
 #ifdef DEBUG
 	fprintf(stderr,"After args\n");
@@ -597,6 +617,11 @@ int main(int argc, char* argv[]) {
 		} else {
 			return_code = 0;
 		}
+	}
+
+	if (gap_map) {
+		gap_map_render();
+		gap_map_free();
 	}
 
 	free(targetname);

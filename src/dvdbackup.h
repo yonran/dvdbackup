@@ -48,6 +48,11 @@ extern gap_strategy_t gap_strategy;
 extern unsigned int gap_random_seed;
 extern int gap_random_seed_set;
 extern int compare_only;
+extern int gap_map;
+
+void gap_map_reset(void);
+void gap_map_render(void);
+void gap_map_free(void);
 
 int DVDDisplayInfo(dvd_reader_t*, char*);
 int DVDGetTitleName(const char*, char*);

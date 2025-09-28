@@ -34,6 +34,14 @@ General backup information:
 	Control how gaps are scanned with --gap-strategy (forward, reverse,
 	outside-in, random) and optionally set a deterministic --gap-random-seed
 	when using the random strategy.
+	Use --cmp to compare an existing mirror against the disc without
+	touching the files; it currently requires -M and no other copy mode.
+	Pair --cmp with --gap-map to emit an ASCII polar plot of blank or missing
+	sectors. Rows represent the disc radius (inner hub to outer edge) and
+	columns approximate the angle around the disc. '#' markers highlight
+	sectors that read as all-zero or were missing locally, making radial or
+	tangential scratches easy to spot. --gap-map is read-only and refuses to
+	run together with --gaps.
 
 	However the -t and (-t -s/-e) switch is a bit different the titles
 	sectors will be written to the original file but not at the same offset
