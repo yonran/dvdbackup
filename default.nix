@@ -6,13 +6,6 @@ pkgs.stdenv.mkDerivation rec {
 
   src = ./.;
 
-  patches = [
-    # Generated via `diff -u src/dvdbackup.c.orig src/dvdbackup.c` for
-    # libdvdread >= 6 API changes; keeps main tree clean while nix-build uses it.
-    ./patches/dvdbackup-dvdread-6.1.patch
-  ];
-
-
   nativeBuildInputs = with pkgs; [
     autoreconfHook
     gettext
