@@ -40,7 +40,8 @@ General backup information:
 	sectors. Rows represent the disc radius (inner hub to outer edge) and
 	columns approximate the angle around the disc. '#' markers highlight
 	sectors that read as all-zero or were missing locally, making radial or
-	tangential scratches easy to spot. --gap-map is read-only and refuses to
+	tangential scratches easy to spot. A summary line also reports the
+	percentage of flagged sectors. --gap-map is read-only and refuses to
 	run together with --gaps.
 
 	However the -t and (-t -s/-e) switch is a bit different the titles

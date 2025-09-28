@@ -281,6 +281,7 @@ typedef struct {
 
 static gap_map_info_t gap_map_info = {0};
 static size_t gap_map_total_blocks = 0;
+static size_t gap_map_bad_blocks = 0;
 
 
 static void gap_plan_free(gap_plan_t* plan) {
@@ -357,6 +358,7 @@ void gap_map_reset(void) {
 	gap_map_info.count = 0;
 	gap_map_info.capacity = 0;
 	gap_map_total_blocks = 0;
+	gap_map_bad_blocks = 0;
 }
 
 
@@ -380,6 +382,7 @@ static int gap_map_add_entry(size_t start_block, size_t block_count) {
 	entry = &gap_map_info.entries[gap_map_info.count++];
 	entry->start_block = start_block;
 	entry->block_count = block_count;
+	gap_map_bad_blocks += block_count;
 	return 0;
 }
 
@@ -418,6 +421,7 @@ void gap_map_render(void) {
 	size_t i;
 	const size_t inner_turn = 192;
 	const size_t outer_turn = 432;
+	double pct = 0.0;
 
 	if (gap_map_total_blocks == 0) {
 		printf(_("Gap map: no sectors examined.\n"));
@@ -477,7 +481,12 @@ void gap_map_render(void) {
 		}
 		printf("|\n");
 	}
+	if (gap_map_total_blocks > 0) {
+		pct = ((double)gap_map_bad_blocks * 100.0) / (double)gap_map_total_blocks;
+	}
 	printf(_("# marks sectors that appear blank or missing. Angle is estimated using an average turn length.\n"));
+	printf(_("Gap map summary: %zu of %zu sectors flagged (%.2f%%).\n"),
+		gap_map_bad_blocks, gap_map_total_blocks, pct);
 }
 
 
@@ -487,6 +496,7 @@ void gap_map_free(void) {
 	gap_map_info.count = 0;
 	gap_map_info.capacity = 0;
 	gap_map_total_blocks = 0;
+	gap_map_bad_blocks = 0;
 }
 
 

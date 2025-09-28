@@ -112,6 +112,9 @@ zero-filled or missing locally. This option is read-only, implies compare mode
 and refuses to run together with
 .B \-\-gaps
 or any writing mode.
+.PP
+The printed summary line reports how many sectors were flagged and what
+percentage of the scanned surface that represents.
 .TP
 .B \-\-no-overwrite
 abort if the target title directory already exists
@@ -159,7 +162,9 @@ to validate the files without rewriting them. Pair it with
 to print a 20x60 ASCII polar plot that highlights sectors that read back as
 zero or were missing locally. Rows correspond to the radius from the inner hub
 to the outer edge; columns approximate the angle around the disc, making radial
-versus tangential scratches easy to spot. Gap-map is read-only and will refuse
+versus tangential scratches easy to spot. The summary line also prints the
+flagged-sector percentage so you can gauge the overall damage at a glance.
+Gap-map is read-only and will refuse
 to execute alongside
 .B \-\-gaps
 since both options expect exclusive control over gap handling.
